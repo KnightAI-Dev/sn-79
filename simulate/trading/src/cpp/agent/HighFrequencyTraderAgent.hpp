@@ -98,14 +98,14 @@ private:
     
     double m_noiseRay;
     double m_shiftPercentage;
-    std::vector<double> m_orderMean;
+    double m_orderMean;
+    std::vector<double> m_orderSizes;
     double m_orderSTD;
 
     double m_pRes;
     double m_sigmaSqr;
     DelayBounds m_opl;
-    double m_targetMTR;
-    double m_margin;
+    double m_maxRate;
     double m_sigmaMargin;
     double m_rateSensitivity;
     double m_spreadSensitivityExp;
@@ -130,12 +130,9 @@ private:
     std::vector<double> m_deltaHFT;
     std::vector<Timestamp> m_tauHFT;
 
-    std::vector<boost::circular_buffer<double>> m_priceHist;
-    std::vector<boost::circular_buffer<double>> m_logReturns;
     std::vector<TimestampedTradePrice> m_tradePrice;
     std::unique_ptr<taosim::stats::Distribution> m_orderPlacementLatencyDistribution;
     std::unique_ptr<taosim::stats::Distribution> m_priceShiftDistribution;
-    std::normal_distribution<double> m_marginDist;
 };
 
 //-------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2025 Rayleigh Research <to@rayleigh.re>
 # SPDX-License-Identifier: MIT
 import os
+import sys
 import traceback
 import time
 import torch
@@ -8,14 +9,219 @@ import psutil
 import asyncio
 import bittensor as bt
 import pandas as pd
+import posix_ipc
+import mmap
+import struct
+import pickle
+import msgpack
 
 from typing import Dict
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from taos.im.neurons.validator import Validator
-from taos.im.protocol.models import TradeInfo
+from taos.im.protocol.models import TradeInfo, MarketSimulationConfig
+from taos.im.protocol.events import TradeEvent
 
 from taos.common.utils.prometheus import prometheus
 from taos.im.utils import duration_from_timestamp
 from prometheus_client import Counter, Gauge, Info
+
+class ReportingService:
+    def __init__(self, config):
+        self.config = config
+        self.wallet = bt.wallet(
+            path=self.config.wallet.path,
+            name=self.config.wallet.name,
+            hotkey=self.config.wallet.hotkey
+        )
+        self.running = True
+        self.prometheus_initialized = False
+        
+        self.request_queue = posix_ipc.MessageQueue(
+            "/validator-report-req",
+            flags=posix_ipc.O_CREAT,
+            max_messages=2,
+            max_message_size=1024
+        )
+        self.response_queue = posix_ipc.MessageQueue(
+            "/validator-report-res",
+            flags=posix_ipc.O_CREAT,
+            max_messages=2,
+            max_message_size=1024
+        )
+        self.request_shm = posix_ipc.SharedMemory(
+            "/validator-report-data",
+            flags=posix_ipc.O_CREAT,
+            size=500 * 1024 * 1024
+        )
+        self.response_shm = posix_ipc.SharedMemory(
+            f"/validator-report-response-data",
+            flags=posix_ipc.O_CREAT,
+            size=50 * 1024 * 1024
+        )
+        
+        self.request_mem = mmap.mmap(self.request_shm.fd, self.request_shm.size)
+        self.response_mem = mmap.mmap(self.response_shm.fd, self.response_shm.size)
+        
+        self.thread_pool = ThreadPoolExecutor(max_workers=2)
+        self.report_executor = ThreadPoolExecutor(max_workers=1)        
+        self._init_prometheus()
+    
+    def _init_prometheus(self):
+        prometheus(
+            config=self.config,
+            port=self.config.prometheus_port,
+            level=None
+        )
+        self.prometheus_counters = Counter('counters', 'Counter summaries for the running validator.', ['wallet', 'netuid', 'timestamp', 'counter_name'])
+        self.prometheus_simulation_gauges = Gauge('simulation_gauges', 'Gauge summaries for global simulation metrics.', ['wallet', 'netuid', 'simulation_gauge_name'])
+        self.prometheus_validator_gauges = Gauge('validator_gauges', 'Gauge summaries for validator-related metrics.', ['wallet', 'netuid', 'validator_gauge_name'])
+        self.prometheus_miner_gauges = Gauge('miner_gauges', 'Gauge summaries for miner-related metrics.', ['wallet', 'netuid', 'agent_id', 'miner_gauge_name'])
+        self.prometheus_book_gauges = Gauge('book_gauges', 'Gauge summaries for book-related metrics.', ['wallet', 'netuid', 'book_id', 'level', 'book_gauge_name'])
+        self.prometheus_agent_gauges = Gauge('agent_gauges', 'Gauge summaries for agent-related metrics.', ['wallet', 'netuid', 'book_id', 'agent_id', 'agent_gauge_name'])
+        self.prometheus_trades = Gauge('trades', 'Gauge summaries for trade metrics.', [
+            'wallet', 'netuid', 'timestamp', 'timestamp_str', 'book_id', 'agent_id', 'trade_id',
+            'aggressing_order_id', 'aggressing_agent_id', 'resting_order_id', 'resting_agent_id',
+            'maker_fee', 'taker_fee',
+            'price', 'volume', 'side', 'trade_gauge_name'])
+        self.prometheus_miner_trades = Gauge('miner_trades', 'Gauge summaries for agent trade metrics.', [
+            'wallet', 'netuid', 'timestamp', 'timestamp_str', 'book_id', 'uid',
+            'role', 'price', 'volume', 'side', 'fee',
+            'miner_trade_gauge_name'])
+        self.prometheus_books = Gauge('books', 'Gauge summaries for book snapshot metrics.', [
+            'wallet', 'netuid', 'timestamp', 'timestamp_str', 'book_id',
+            'bid_5', 'bid_vol_5', 'bid_4', 'bid_vol_4', 'bid_3', 'bid_vol_3', 'bid_2', 'bid_vol_2', 'bid_1', 'bid_vol_1',
+            'ask_5', 'ask_vol_5', 'ask_4', 'ask_vol_4', 'ask_3', 'ask_vol_3', 'ask_2', 'ask_vol_2', 'ask_1', 'ask_vol_1',
+            'book_gauge_name'
+        ])
+        self.prometheus_miners = Gauge('miners', 'Gauge summaries for miner metrics.', [
+            'wallet', 'netuid', 'timestamp', 'timestamp_str', 'agent_id',
+            'placement', 'base_balance', 'base_loan', 'base_collateral', 'quote_balance', 'quote_loan', 'quote_collateral',
+            'inventory_value', 'inventory_value_change', 'pnl', 'pnl_change',
+            'min_daily_volume','activity_factor', 'sharpe', 'sharpe_penalty', 'sharpe_score', 'unnormalized_score', 'score',
+            'miner_gauge_name'
+        ])
+        self.prometheus_info = Info('neuron_info', "Info summaries for the running validator.", ['wallet', 'netuid'])
+        self.prometheus_initialized = True
+    
+    async def run(self):        
+        bt.logging.info("Reporting service started")
+
+        while True:
+            try:
+                self.request_queue.receive(timeout=0.001)
+                bt.logging.warning("Drained stale message from reporting request queue")
+            except posix_ipc.BusyError:
+                break
+        
+        while self.running:
+            try:
+                message, _ = self.request_queue.receive(timeout=1.0)
+                command = message.decode('utf-8')
+                
+                if command == 'publish':
+                    read_start = time.time()
+                    self.request_mem.seek(0)
+                    size_bytes = self.request_mem.read(8)
+                    data_size = struct.unpack('Q', size_bytes)[0]
+                    request_bytes = self.request_mem.read(data_size)
+                    
+                    deserialize_start = time.time()
+                    data = msgpack.unpackb(request_bytes, raw=False, strict_map_key=False)
+                    deserialize_time = time.time() - deserialize_start
+                    
+                    bt.logging.info(f"Read reporting data ({time.time()-read_start:.4f}s, deserialize={deserialize_time:.4f}s)")
+
+                    await self.publish_metrics(data)
+                    
+                    result = {
+                        'initial_balances_published': self.initial_balances_published,                        
+                        'miner_stats': self.miner_stats
+                    }
+                    write_start = time.time()
+                    
+                    serialize_start = time.time()
+                    result_bytes = msgpack.packb(result, use_bin_type=True)
+                    serialize_time = time.time() - serialize_start
+                    
+                    self.response_mem.seek(0)
+                    self.response_mem.write(struct.pack('Q', len(result_bytes)))
+                    self.response_mem.write(result_bytes)
+                    bt.logging.info(f"Wrote response data ({time.time()-write_start:.4f}s, serialize={serialize_time:.4f}s)")
+
+                    self.response_queue.send(b'ready')
+                    
+                elif command == 'shutdown':
+                    bt.logging.info("Shutdown command received")
+                    self.running = False
+                    
+            except posix_ipc.BusyError:
+                await asyncio.sleep(0.01)
+            except Exception as e:
+                bt.logging.error(f"Error in reporting loop: {e}")
+                bt.logging.error(traceback.format_exc())
+        
+        self.cleanup()
+    
+    async def publish_metrics(self, data):
+        def deserialize_tuple_keys(d):
+            return {eval(k): v for k, v in d.items()}
+
+        self.recent_trades = {
+            int(bookId): [TradeInfo(**t) for t in trades] 
+            for bookId, trades in data['recent_trades'].items()
+        }
+        self.recent_miner_trades = {
+            int(uid): {
+                int(bookId): [(TradeEvent(**item['trade']), item['role']) for item in trades]
+                for bookId, trades in book_trades.items()
+            }
+            for uid, book_trades in data['recent_miner_trades'].items()
+        }
+
+        self.volume_sums = deserialize_tuple_keys(data['volume_sums'])
+        self.maker_volume_sums = deserialize_tuple_keys(data['maker_volume_sums'])
+        self.taker_volume_sums = deserialize_tuple_keys(data['taker_volume_sums'])
+        self.self_volume_sums = deserialize_tuple_keys(data['self_volume_sums'])
+        
+        for key in ['inventory_history', 'activity_factors', 'sharpe_values', 'unnormalized_scores', 
+                    'scores', 'miner_stats', 'initial_balances', 'initial_balances_published',
+                    'simulation_timestamp', 'step', 'step_rates', 'fundamental_price',
+                    'shared_state_rewarding', 'current_block', 'uid', 'metagraph_data']:
+            setattr(self, key, data[key])
+        
+        class SimpleState:
+            pass
+        self.last_state = SimpleState()
+        self.last_state.accounts = data['last_state']['accounts']
+        self.last_state.books = data['last_state']['books']
+        self.last_state.notices = data['last_state']['notices']
+        
+        class SimpleMetagraph:
+            pass
+        self.metagraph = SimpleMetagraph()
+        for key, value in self.metagraph_data.items():
+            setattr(self.metagraph, key, value)
+        
+        self.simulation = MarketSimulationConfig(**data['simulation'])
+        
+        if not self.prometheus_initialized:
+            self._init_prometheus()
+        
+        await report(self)
+    
+    def pagerduty_alert(self, message, details=None):
+        bt.logging.error(f"ALERT: {message}")
+        if details:
+            bt.logging.error(f"Details: {details}")
+    
+    def cleanup(self):
+        self.request_queue.close()
+        self.response_queue.close()
+        self.request_mem.close()
+        self.request_shm.close_fd()
+        self.thread_pool.shutdown(wait=True)
+        self.report_executor.shutdown(wait=True)
 
 def init_metrics(self : Validator) -> None:
     """
@@ -62,7 +268,7 @@ def init_metrics(self : Validator) -> None:
     ])
     self.prometheus_info = Info('neuron_info', "Info summaries for the running validator.", ['wallet', 'netuid'])
 
-def publish_validator_gauges(self : Validator):
+def publish_validator_gauges(self: ReportingService):
     """
     Publishes validator-specific metrics to Prometheus gauges.
     
@@ -94,7 +300,7 @@ def publish_validator_gauges(self : Validator):
     self.prometheus_validator_gauges.labels( wallet=self.wallet.hotkey.ss58_address, netuid=self.config.netuid, validator_gauge_name="disk_usage_percent").set( disk_usage )    
     bt.logging.debug(f"Validator metrics published ({time.time()-start:.4f}s).")
 
-def publish_info(self : Validator) -> None:
+def publish_info(self: ReportingService) -> None:
     """
     Publishes static simulation and validator information metrics
 
@@ -182,19 +388,16 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
         for agentId in accounts.keys():
             daily_volumes[agentId] = {}
             for bookId in range(validator_data['book_count']):
-                # Get total volume from cache
                 total_vol = volume_sums.get((agentId, bookId), 0.0)
                 total_maker_vol = maker_volume_sums.get((agentId, bookId), 0.0)
                 total_taker_vol = taker_volume_sums.get((agentId, bookId), 0.0)
                 total_self_vol = self_volume_sums.get((agentId, bookId), 0.0)
                 daily_volumes[agentId][bookId] = {
                     'total': total_vol,
-                    'maker': total_maker_vol,  # If you need these, add separate caches
+                    'maker': total_maker_vol,
                     'taker': total_taker_vol,
                     'self': total_self_vol,
                 }
-
-        # Calculate inventory history totals and PNL
         inventory_history = validator_data['inventory_history']
         total_inventory_history = {}
         pnl = {}
@@ -202,20 +405,18 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
         for agentId in accounts.keys():
             if agentId < 0 or len(inventory_history[agentId]) < 3:
                 continue
-            total_inventory_history[agentId] = [
+            total_inventory_history[agentId] = [                
                 sum(list(inventory_value.values()))
                 for inventory_value in list(inventory_history[agentId].values())
             ]
             pnl[agentId] = total_inventory_history[agentId][-1] - total_inventory_history[agentId][0]
 
-        # Calculate scores and placements
         scores = torch.FloatTensor(list(validator_data['scores'].values()))
         indices = scores.argsort(dim=-1, descending=True)
         placements = torch.empty_like(indices).scatter_(
             -1, indices, torch.arange(scores.size(-1), device=scores.device)
         )
 
-        # Prepare metrics for each miner
         miner_metrics = {}
         for agentId, accounts_data in accounts.items():
             if agentId < 0 or len(inventory_history[agentId]) < 3:
@@ -321,7 +522,7 @@ def report_worker(validator_data: Dict, state_data: Dict) -> Dict:
     return result
 
 
-async def report(self: 'Validator') -> None:
+async def report(self: ReportingService) -> None:
     """
     Calculates and publishes metrics related to simulation state, validator and agent performance.
 
@@ -336,78 +537,69 @@ async def report(self: 'Validator') -> None:
         simulation_duration = duration_from_timestamp(self.simulation_timestamp)
         bt.logging.info(f"Publishing Metrics at Step {self.step} ({simulation_duration})...")
         report_start = time.time()
-        bt.logging.debug(f"Publishing simulation metrics...")
+        updates = deque()    
+        bt.logging.debug(f"Collecting simulation metrics...")
         start = time.time()
+        
+        agent_gauges = self.prometheus_agent_gauges
+        book_gauges = self.prometheus_book_gauges
+        miner_gauges = self.prometheus_miner_gauges
+        wallet_addr = self.wallet.hotkey.ss58_address
+        netuid = self.config.netuid
 
-        _set_if_changed(
+        updates.append((
             self.prometheus_simulation_gauges,
             self.simulation_timestamp,
-            self.wallet.hotkey.ss58_address,
-            self.config.netuid,
+            wallet_addr,
+            netuid,
             "timestamp"
-        )
+        ))
 
-        _set_if_changed(
+        updates.append((
             self.prometheus_simulation_gauges,
             sum(self.step_rates) / len(self.step_rates) if len(self.step_rates) > 0 else 0,
-            self.wallet.hotkey.ss58_address,
-            self.config.netuid,
+            wallet_addr,
+            netuid,
             "step_rate"
-        )
-        bt.logging.debug(f"Simulation metrics published ({time.time()-start:.4f}s).")
+        ))
+        bt.logging.debug(f"Simulation metrics collected ({time.time()-start:.4f}s).")
 
         has_new_trades = False
         has_new_miner_trades = False
 
-        publish_validator_gauges(self)
+        publish_info(self)
 
         self.prometheus_books.clear()
 
-        if self.simulation.logDir:
-            await asyncio.sleep(0)
-            bt.logging.debug(f"Retrieving fundamental prices...")
-            start = time.time()
-            self.load_fundamental()
-            bt.logging.debug(f"Retrieved fundamental prices ({time.time()-start:.4f}s).")
-
-        bt.logging.debug(f"Publishing book metrics...")
+        bt.logging.debug(f"Collecting book metrics...")
+        book_start = time.time()
         for bookId, book in self.last_state.books.items():
-            await asyncio.sleep(0)
-            # --- Book bids ---
             if book['b']:
-                start = time.time()
                 bid_cumsum = 0
                 for i, level in enumerate(book['b']):
-                    _set_if_changed(self.prometheus_book_gauges, level['p'],
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, i, "bid")
-                    _set_if_changed(self.prometheus_book_gauges, level['q'],
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, i, "bid_vol")
+                    updates.append((book_gauges, level['p'],
+                        wallet_addr, netuid, bookId, i, "bid"))
+                    updates.append((book_gauges, level['q'],
+                        wallet_addr, netuid, bookId, i, "bid_vol"))
                     bid_cumsum += level['q']
-                    _set_if_changed(self.prometheus_book_gauges, bid_cumsum,
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, i, "bid_vol_sum")
+                    updates.append((book_gauges, bid_cumsum,
+                        wallet_addr, netuid, bookId, i, "bid_vol_sum"))
                     if i == 20: break
-            # --- Book asks ---
             if book['a']:
-                start = time.time()
                 ask_cumsum = 0
                 for i, level in enumerate(book['a']):
-                    _set_if_changed(self.prometheus_book_gauges, level['p'],
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, i, "ask")
-                    _set_if_changed(self.prometheus_book_gauges, level['q'],
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, i, "ask_vol")
+                    updates.append((book_gauges, level['p'],
+                        wallet_addr, netuid, bookId, i, "ask"))
+                    updates.append((book_gauges, level['q'],
+                        wallet_addr, netuid, bookId, i, "ask_vol"))
                     ask_cumsum += level['q']
-                    _set_if_changed(self.prometheus_book_gauges, ask_cumsum,
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, i, "ask_vol_sum")
+                    updates.append((book_gauges, ask_cumsum,
+                        wallet_addr, netuid, bookId, i, "ask_vol_sum"))
                     if i == 20: break
-
-            bt.logging.debug(f"Book {bookId} levels metrics published ({time.time()-start:.4f}s).")
-
-            # --- Book aggregate metrics ---
             if book['b'] and book['a']:
-                start = time.time()
                 mid = (book['b'][0]['p'] + book['a'][0]['p']) / 2
-                _set_if_changed(self.prometheus_book_gauges, mid,
-                    self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "mid")
+                updates.append((book_gauges, mid,
+                    wallet_addr, netuid, bookId, 0, "mid"))
 
                 def get_price(side, idx):
                     if side == 'bid':
@@ -421,81 +613,77 @@ async def report(self: 'Validator') -> None:
                     if side == 'ask':
                         return book['a'][idx]['q'] if len(book['a']) > idx else 0
 
-                _set_if_changed(self.prometheus_books, 1.0,
-                    self.wallet.hotkey.ss58_address, self.config.netuid, self.simulation_timestamp, simulation_duration, bookId,
+                updates.append((self.prometheus_books, 1.0,
+                    wallet_addr, netuid, self.simulation_timestamp, simulation_duration, bookId,
                     get_price('bid',4), get_vol('bid',4), get_price('bid',3), get_vol('bid',3), get_price('bid',2), get_vol('bid',2),
                     get_price('bid',1), get_vol('bid',1), get_price('bid',0), get_vol('bid',0),
                     get_price('ask',4), get_vol('ask',4), get_price('ask',3), get_vol('ask',3), get_price('ask',2), get_vol('ask',2),
                     get_price('ask',1), get_vol('ask',1), get_price('ask',0), get_vol('ask',0),
                     "books"
-                )
-                bt.logging.debug(f"Book {bookId} aggregate metrics published ({time.time()-start:.4f}s).")
-
-            # --- Book trade events ---
+                ))
             if book['e']:
                 trades = [event for event in book['e'] if event['y'] == 't']
                 if trades:
-                    start = time.time()
                     last_trade = trades[-1]
                     if isinstance(self.fundamental_price[0], pd.Series):
-                        _set_if_changed(self.prometheus_book_gauges,
+                        updates.append((book_gauges,
                             self.fundamental_price[bookId].iloc[-1],
-                            self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "fundamental_price")
+                            wallet_addr, netuid, bookId, 0, "fundamental_price"))
                     else:
                         if self.fundamental_price[bookId]:
-                            _set_if_changed(self.prometheus_book_gauges,
+                            updates.append((book_gauges,
                                 self.fundamental_price[bookId],
-                                self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "fundamental_price")
+                                wallet_addr, netuid, bookId, 0, "fundamental_price"))
                         else:
                             try:
-                                self.prometheus_book_gauges.remove(self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "fundamental_price")
+                                book_gauges.remove(wallet_addr, netuid, bookId, 0, "fundamental_price")
                             except KeyError:
                                 pass
 
-                    _set_if_changed(self.prometheus_book_gauges, last_trade['p'],
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "trade_price")
-                    _set_if_changed(self.prometheus_book_gauges, sum([trade['q'] for trade in trades]),
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "trade_volume")
-                    _set_if_changed(self.prometheus_book_gauges, sum([trade['q'] for trade in trades if trade['s'] == 0]),
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "trade_buy_volume")
-                    _set_if_changed(self.prometheus_book_gauges, sum([trade['q'] for trade in trades if trade['s'] == 1]),
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "trade_sell_volume")
+                    updates.append((book_gauges, last_trade['p'],
+                        wallet_addr, netuid, bookId, 0, "trade_price"))
+                    updates.append((book_gauges, sum([trade['q'] for trade in trades]),
+                        wallet_addr, netuid, bookId, 0, "trade_volume"))
+                    updates.append((book_gauges, sum([trade['q'] for trade in trades if trade['s'] == 0]),
+                        wallet_addr, netuid, bookId, 0, "trade_buy_volume"))
+                    updates.append((book_gauges, sum([trade['q'] for trade in trades if trade['s'] == 1]),
+                        wallet_addr, netuid, bookId, 0, "trade_sell_volume"))
 
                     has_new_trades = True
-
-                bt.logging.debug(f"Book {bookId} events metrics published ({time.time()-start:.4f}s).")
-            
-            # --- Book Fees ---
             if self.simulation.fee_policy.fee_type == 'dynamic':
                 DISMTR = self.last_state.books[bookId]['mtr']
                 DISmakerRate = self.last_state.accounts[0][bookId]['f']['m']
                 DIStakerRate = self.last_state.accounts[0][bookId]['f']['t']
-                _set_if_changed(self.prometheus_book_gauges, DISmakerRate,
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "dynamic_maker_rate")
-                _set_if_changed(self.prometheus_book_gauges, DIStakerRate,
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "dynamic_taker_rate")
-                _set_if_changed(self.prometheus_book_gauges, DISMTR,
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, 0, "maker_taker_ratio")
+                updates.append((book_gauges, DISmakerRate,
+                        wallet_addr, netuid, bookId, 0, "dynamic_maker_rate"))
+                updates.append((book_gauges, DIStakerRate,
+                        wallet_addr, netuid, bookId, 0, "dynamic_taker_rate"))
+                updates.append((book_gauges, DISMTR,
+                        wallet_addr, netuid, bookId, 0, "maker_taker_ratio"))
+        bt.logging.debug(f"Book metrics collected ({time.time()-book_start:.4f}s).")
 
-        await self.wait_for(lambda: self.shared_state_rewarding, "Waiting for reward calculation to complete before computing metrics...")
-        # --- Trades metrics ---
         if has_new_trades:
-            bt.logging.debug(f"Publishing trade metrics...")
+            bt.logging.debug(f"Collecting trade metrics...")
             start = time.time()
             self.prometheus_trades.clear()
             for bookId, trades in self.recent_trades.items():
-                await asyncio.sleep(0)
                 for trade in trades:
-                    _set_if_changed(self.prometheus_trades, 1.0,
-                        self.wallet.hotkey.ss58_address, self.config.netuid, trade.timestamp, duration_from_timestamp(trade.timestamp),
+                    updates.append((self.prometheus_trades, 1.0,
+                        wallet_addr, netuid, trade.timestamp, duration_from_timestamp(trade.timestamp),
                         bookId, trade.taker_agent_id, trade.id, trade.taker_id, trade.taker_agent_id, trade.maker_id, trade.maker_agent_id,
-                        trade.maker_fee, trade.taker_fee, trade.price, trade.quantity, trade.side, "trades")
+                        trade.maker_fee, trade.taker_fee, trade.price, trade.quantity, trade.side, "trades"))
 
-        bt.logging.debug(f"Trade metrics published ({time.time()-start:.4f}s).")
+            bt.logging.debug(f"Trade metrics collected ({time.time()-start:.4f}s).")
 
         if not self.last_state.accounts:
+            bt.logging.info(f"Applying {len(updates)} metric updates...")
+            apply_start = time.time()
+            for update in updates:
+                _set_if_changed(*update)
+            bt.logging.info(f"Applied {len(updates)} updates in {time.time()-apply_start:.4f}s")
             bt.logging.info(f"Metrics Published for Step {report_step} ({time.time()-report_start}s).")
             return
+            
         bt.logging.debug(f"Computing miner metrics in worker process...")
         computation_start = time.time()
         volume_sums_snapshot = dict(self.volume_sums)
@@ -514,7 +702,7 @@ async def report(self: 'Validator') -> None:
             'activity_factors': self.activity_factors,
             'sharpe_values': self.sharpe_values,
             'unnormalized_scores': self.unnormalized_scores,
-            'scores': {i: score.item() for i, score in enumerate(self.scores)},
+            'scores': self.scores,
             'book_count': self.simulation.book_count,
             'simulation_config': {
                 'volumeDecimals': self.simulation.volumeDecimals,
@@ -535,8 +723,7 @@ async def report(self: 'Validator') -> None:
         result = future.result()
 
         if result['error']:
-            bt.logging.error(f"Error in report worker: {result['error']}")
-            bt.logging.debug(f"Traceback: {result.get('traceback', 'N/A')}")
+            bt.logging.error(f"Error in report worker: {result['error']}\n{result.get('traceback', 'N/A')}")
             return
 
         bt.logging.debug(f"Miner metrics computed ({time.time()-computation_start:.4f}s).")
@@ -545,69 +732,81 @@ async def report(self: 'Validator') -> None:
         miner_metrics = metrics['miner_metrics']
         daily_volumes = metrics['daily_volumes']
 
-        bt.logging.debug(f"Publishing accounts metrics...")
+        bt.logging.debug(f"Collecting agent book metrics...")
         start = time.time()
 
+        bt.logging.debug(f"Pre-extracting inventory/sharpe data...")
+        extract_start = time.time()
+
+        start_inventories = {}
+        last_inventories = {}
+        sharpe_data = {}
+        for agentId in self.last_state.accounts.keys():
+            if agentId < 0 or len(self.inventory_history[agentId]) < 3:
+                continue
+            inv_values = list(self.inventory_history[agentId].values())
+            start_inventories[agentId] = [i for i in inv_values if len(i) > 0][0]
+            last_inventories[agentId] = inv_values[-1]
+            sharpe_data[agentId] = self.sharpe_values[agentId]
+        bt.logging.debug(f"Pre-extraction complete ({time.time()-extract_start:.4f}s)")
+
         for agentId, accounts in self.last_state.accounts.items():
-            await asyncio.sleep(0)
             initial_balance_publish_status = {bookId: False for bookId in range(self.simulation.book_count)}
             for bookId, account in accounts.items():
                 if self.initial_balances[agentId][bookId]['BASE'] is not None and not self.initial_balances_published[agentId]:
-                    _set_if_changed(self.prometheus_agent_gauges, self.initial_balances[agentId][bookId]['BASE'],
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "base_balance_initial")
-                    _set_if_changed(self.prometheus_agent_gauges, self.initial_balances[agentId][bookId]['QUOTE'],
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "quote_balance_initial")
-                    _set_if_changed(self.prometheus_agent_gauges, self.initial_balances[agentId][bookId]['WEALTH'],
-                        self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "wealth_initial")
+                    updates.append((agent_gauges, self.initial_balances[agentId][bookId]['BASE'],
+                        wallet_addr, netuid, bookId, agentId, "base_balance_initial"))
+                    updates.append((agent_gauges, self.initial_balances[agentId][bookId]['QUOTE'],
+                        wallet_addr, netuid, bookId, agentId, "quote_balance_initial"))
+                    updates.append((agent_gauges, self.initial_balances[agentId][bookId]['WEALTH'],
+                        wallet_addr, netuid, bookId, agentId, "wealth_initial"))
                     initial_balance_publish_status[bookId] = True
             if all(initial_balance_publish_status.values()):
                 self.initial_balances_published[agentId] = True
 
-            if agentId < 0 or len(self.inventory_history[agentId]) < 3:
+            if agentId not in start_inventories:
                 continue
 
-            start_inv = [i for i in list(self.inventory_history[agentId].values()) if len(i) > bookId][0]
-            last_inv = list(self.inventory_history[agentId].values())[-1]
-            sharpes = self.sharpe_values[agentId]
+            start_inv = start_inventories[agentId]
+            last_inv = last_inventories[agentId]
+            sharpes = sharpe_data[agentId]
 
             for bookId, account in accounts.items():
-                _set_if_changed(self.prometheus_agent_gauges, account['bb']['t'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "base_balance_total")
-                _set_if_changed(self.prometheus_agent_gauges, account['bb']['f'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "base_balance_free")
-                _set_if_changed(self.prometheus_agent_gauges, account['bb']['r'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "base_balance_reserved")
-                _set_if_changed(self.prometheus_agent_gauges, account['qb']['t'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "quote_balance_total")
-                _set_if_changed(self.prometheus_agent_gauges, account['qb']['f'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "quote_balance_free")
-                _set_if_changed(self.prometheus_agent_gauges, account['qb']['r'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "quote_balance_reserved")
-                _set_if_changed(self.prometheus_agent_gauges, account['bl'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "base_loan")
-                _set_if_changed(self.prometheus_agent_gauges, account['bc'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "base_collateral")
-                _set_if_changed(self.prometheus_agent_gauges, account['ql'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "quote_loan")
-                _set_if_changed(self.prometheus_agent_gauges, account['qc'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "quote_collateral")
+                updates.append((agent_gauges, account['bb']['t'], wallet_addr, netuid, bookId, agentId, "base_balance_total"))
+                updates.append((agent_gauges, account['bb']['f'], wallet_addr, netuid, bookId, agentId, "base_balance_free"))
+                updates.append((agent_gauges, account['bb']['r'], wallet_addr, netuid, bookId, agentId, "base_balance_reserved"))
+                updates.append((agent_gauges, account['qb']['t'], wallet_addr, netuid, bookId, agentId, "quote_balance_total"))
+                updates.append((agent_gauges, account['qb']['f'], wallet_addr, netuid, bookId, agentId, "quote_balance_free"))
+                updates.append((agent_gauges, account['qb']['r'], wallet_addr, netuid, bookId, agentId, "quote_balance_reserved"))
+                updates.append((agent_gauges, account['bl'], wallet_addr, netuid, bookId, agentId, "base_loan"))
+                updates.append((agent_gauges, account['bc'], wallet_addr, netuid, bookId, agentId, "base_collateral"))
+                updates.append((agent_gauges, account['ql'], wallet_addr, netuid, bookId, agentId, "quote_loan"))
+                updates.append((agent_gauges, account['qc'], wallet_addr, netuid, bookId, agentId, "quote_collateral"))
                 if account['f']['v']:
-                    _set_if_changed(self.prometheus_agent_gauges, account['f']['v'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "fees_traded_volume")
-                _set_if_changed(self.prometheus_agent_gauges, account['f']['m'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "fees_maker_rate")
-                _set_if_changed(self.prometheus_agent_gauges, account['f']['t'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "fees_taker_rate")
-                _set_if_changed(self.prometheus_agent_gauges, last_inv[bookId], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "inventory_value")
-                _set_if_changed(self.prometheus_agent_gauges, last_inv[bookId] - start_inv[bookId], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "pnl")
-                _set_if_changed(self.prometheus_agent_gauges, daily_volumes[agentId][bookId]['total'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "daily_volume")
-                _set_if_changed(self.prometheus_agent_gauges, daily_volumes[agentId][bookId]['maker'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "daily_maker_volume")
-                _set_if_changed(self.prometheus_agent_gauges, daily_volumes[agentId][bookId]['taker'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "daily_taker_volume")
-                _set_if_changed(self.prometheus_agent_gauges, daily_volumes[agentId][bookId]['self'], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "daily_self_volume")
-                _set_if_changed(self.prometheus_agent_gauges, self.activity_factors[agentId][bookId], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "activity_factor")
+                    updates.append((agent_gauges, account['f']['v'], wallet_addr, netuid, bookId, agentId, "fees_traded_volume"))
+                updates.append((agent_gauges, account['f']['m'], wallet_addr, netuid, bookId, agentId, "fees_maker_rate"))
+                updates.append((agent_gauges, account['f']['t'], wallet_addr, netuid, bookId, agentId, "fees_taker_rate"))
+                updates.append((agent_gauges, last_inv[bookId], wallet_addr, netuid, bookId, agentId, "inventory_value"))
+                updates.append((agent_gauges, last_inv[bookId] - start_inv[bookId], wallet_addr, netuid, bookId, agentId, "pnl"))
+                updates.append((agent_gauges, daily_volumes[agentId][bookId]['total'], wallet_addr, netuid, bookId, agentId, "daily_volume"))
+                updates.append((agent_gauges, daily_volumes[agentId][bookId]['maker'], wallet_addr, netuid, bookId, agentId, "daily_maker_volume"))
+                updates.append((agent_gauges, daily_volumes[agentId][bookId]['taker'], wallet_addr, netuid, bookId, agentId, "daily_taker_volume"))
+                updates.append((agent_gauges, daily_volumes[agentId][bookId]['self'], wallet_addr, netuid, bookId, agentId, "daily_self_volume"))
+                updates.append((agent_gauges, self.activity_factors[agentId][bookId], wallet_addr, netuid, bookId, agentId, "activity_factor"))
                 if sharpes:
-                    _set_if_changed(self.prometheus_agent_gauges, sharpes['books'][bookId], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "sharpe")
+                    updates.append((agent_gauges, sharpes['books'][bookId], wallet_addr, netuid, bookId, agentId, "sharpe"))
                     if 'books_weighted' in sharpes:
-                        _set_if_changed(self.prometheus_agent_gauges, sharpes['books_weighted'][bookId], self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "weighted_sharpe")
+                        updates.append((agent_gauges, sharpes['books_weighted'][bookId], wallet_addr, netuid, bookId, agentId, "weighted_sharpe"))
                 else:
                     try:
-                        self.prometheus_agent_gauges.remove(self.wallet.hotkey.ss58_address, self.config.netuid, bookId, agentId, "sharpe")
+                        agent_gauges.remove(wallet_addr, netuid, bookId, agentId, "sharpe")
                     except KeyError:
-                        pass
+                        pass                        
+        bt.logging.debug(f"Agent book metrics collected ({time.time()-start:.4f}s).")
 
-        bt.logging.debug(f"Agent book metrics published ({time.time()-start:.4f}s).")
-
-        bt.logging.debug(f"Publishing miner trade metrics...")
+        bt.logging.debug(f"Collecting miner trade metrics...")
         start = time.time()
         for agentId, notices in self.last_state.notices.items():
-            await asyncio.sleep(0)
             if agentId < 0:
                 continue
             for notice in notices:
@@ -620,98 +819,99 @@ async def report(self: 'Validator') -> None:
         if has_new_miner_trades:
             self.prometheus_miner_trades.clear()
             for uid, book_miner_trades in self.recent_miner_trades.items():
-                await asyncio.sleep(0)
                 for bookId, miner_trades in book_miner_trades.items():
                     if len(miner_trades) > 0:
                         last_maker_trade = None
                         last_taker_trade = None
                         for miner_trade, role in self.recent_miner_trades[uid][bookId]:
-                            _set_if_changed(self.prometheus_miner_trades, 1.0,
-                                self.wallet.hotkey.ss58_address, self.config.netuid,
+                            updates.append((self.prometheus_miner_trades, 1.0,
+                                wallet_addr, netuid,
                                 miner_trade.timestamp, duration_from_timestamp(miner_trade.timestamp),
                                 miner_trade.bookId, uid, role,
                                 miner_trade.price, miner_trade.quantity,
                                 miner_trade.side if role == 'taker' else int(not miner_trade.side),
                                 miner_trade.makerFee if role == 'maker' else miner_trade.takerFee,
                                 "miner_trades"
-                            )
+                            ))
                             if role == 'maker':
                                 last_maker_trade = miner_trade
                             if role == 'taker':
                                 last_taker_trade = miner_trade
                         if last_maker_trade:
-                            _set_if_changed(self.prometheus_agent_gauges, last_maker_trade.makerFeeRate, self.wallet.hotkey.ss58_address, self.config.netuid, bookId, uid, "fees_last_maker_rate")
+                            updates.append((agent_gauges, last_maker_trade.makerFeeRate, wallet_addr, netuid, bookId, uid, "fees_last_maker_rate"))
                         if last_taker_trade:
-                            _set_if_changed(self.prometheus_agent_gauges, last_taker_trade.takerFeeRate, self.wallet.hotkey.ss58_address, self.config.netuid, bookId, uid, "fees_last_taker_rate")
+                            updates.append((agent_gauges, last_taker_trade.takerFeeRate, wallet_addr, netuid, bookId, uid, "fees_last_taker_rate"))
         self.prometheus_miners.clear()
+        bt.logging.debug(f"Miner trade metrics collected ({time.time()-start:.4f}s).")
 
+        bt.logging.debug(f"Collecting miner metrics...")
+        start = time.time()
         for agentId in miner_metrics:
-            await asyncio.sleep(0)
             m = miner_metrics[agentId]
 
-            _set_if_changed(self.prometheus_miner_gauges, m['total_base_balance'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_base_balance")
-            _set_if_changed(self.prometheus_miner_gauges, m['total_base_loan'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_base_loan")
-            _set_if_changed(self.prometheus_miner_gauges, m['total_base_collateral'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_base_collateral")
-            _set_if_changed(self.prometheus_miner_gauges, m['total_quote_balance'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_quote_balance")
-            _set_if_changed(self.prometheus_miner_gauges, m['total_quote_loan'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_quote_loan")
-            _set_if_changed(self.prometheus_miner_gauges, m['total_quote_collateral'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_quote_collateral")
-            _set_if_changed(self.prometheus_miner_gauges, m['total_inventory_value'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_inventory_value")
-            _set_if_changed(self.prometheus_miner_gauges, m['pnl'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "pnl")
+            updates.append((miner_gauges, m['total_base_balance'], wallet_addr, netuid, agentId, "total_base_balance"))
+            updates.append((miner_gauges, m['total_base_loan'], wallet_addr, netuid, agentId, "total_base_loan"))
+            updates.append((miner_gauges, m['total_base_collateral'], wallet_addr, netuid, agentId, "total_base_collateral"))
+            updates.append((miner_gauges, m['total_quote_balance'], wallet_addr, netuid, agentId, "total_quote_balance"))
+            updates.append((miner_gauges, m['total_quote_loan'], wallet_addr, netuid, agentId, "total_quote_loan"))
+            updates.append((miner_gauges, m['total_quote_collateral'], wallet_addr, netuid, agentId, "total_quote_collateral"))
+            updates.append((miner_gauges, m['total_inventory_value'], wallet_addr, netuid, agentId, "total_inventory_value"))
+            updates.append((miner_gauges, m['pnl'], wallet_addr, netuid, agentId, "pnl"))
 
-            _set_if_changed(self.prometheus_miner_gauges, m['total_daily_volume']['total'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_daily_volume")
-            _set_if_changed(self.prometheus_miner_gauges, m['total_daily_volume']['maker'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_daily_maker_volume")
-            _set_if_changed(self.prometheus_miner_gauges, m['total_daily_volume']['taker'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_daily_taker_volume")
-            _set_if_changed(self.prometheus_miner_gauges, m['total_daily_volume']['self'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "total_daily_self_volume")
+            updates.append((miner_gauges, m['total_daily_volume']['total'], wallet_addr, netuid, agentId, "total_daily_volume"))
+            updates.append((miner_gauges, m['total_daily_volume']['maker'], wallet_addr, netuid, agentId, "total_daily_maker_volume"))
+            updates.append((miner_gauges, m['total_daily_volume']['taker'], wallet_addr, netuid, agentId, "total_daily_taker_volume"))
+            updates.append((miner_gauges, m['total_daily_volume']['self'], wallet_addr, netuid, agentId, "total_daily_self_volume"))
 
-            _set_if_changed(self.prometheus_miner_gauges, m['average_daily_volume']['total'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "average_daily_volume")
-            _set_if_changed(self.prometheus_miner_gauges, m['average_daily_volume']['maker'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "average_daily_maker_volume")
-            _set_if_changed(self.prometheus_miner_gauges, m['average_daily_volume']['taker'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "average_daily_taker_volume")
-            _set_if_changed(self.prometheus_miner_gauges, m['average_daily_volume']['self'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "average_daily_self_volume")
+            updates.append((miner_gauges, m['average_daily_volume']['total'], wallet_addr, netuid, agentId, "average_daily_volume"))
+            updates.append((miner_gauges, m['average_daily_volume']['maker'], wallet_addr, netuid, agentId, "average_daily_maker_volume"))
+            updates.append((miner_gauges, m['average_daily_volume']['taker'], wallet_addr, netuid, agentId, "average_daily_taker_volume"))
+            updates.append((miner_gauges, m['average_daily_volume']['self'], wallet_addr, netuid, agentId, "average_daily_self_volume"))
 
-            _set_if_changed(self.prometheus_miner_gauges, m['min_daily_volume']['total'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "min_daily_volume")
-            _set_if_changed(self.prometheus_miner_gauges, m['min_daily_volume']['maker'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "min_daily_maker_volume")
-            _set_if_changed(self.prometheus_miner_gauges, m['min_daily_volume']['taker'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "min_daily_taker_volume")
-            _set_if_changed(self.prometheus_miner_gauges, m['min_daily_volume']['self'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "min_daily_self_volume")
+            updates.append((miner_gauges, m['min_daily_volume']['total'], wallet_addr, netuid, agentId, "min_daily_volume"))
+            updates.append((miner_gauges, m['min_daily_volume']['maker'], wallet_addr, netuid, agentId, "min_daily_maker_volume"))
+            updates.append((miner_gauges, m['min_daily_volume']['taker'], wallet_addr, netuid, agentId, "min_daily_taker_volume"))
+            updates.append((miner_gauges, m['min_daily_volume']['self'], wallet_addr, netuid, agentId, "min_daily_self_volume"))
 
-            _set_if_changed(self.prometheus_miner_gauges, m['activity_factor'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "activity_factor")
+            updates.append((miner_gauges, m['activity_factor'], wallet_addr, netuid, agentId, "activity_factor"))
 
             if m['sharpe'] is not None:
-                _set_if_changed(self.prometheus_miner_gauges, m['sharpe'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "sharpe")
+                updates.append((miner_gauges, m['sharpe'], wallet_addr, netuid, agentId, "sharpe"))
                 if m['activity_weighted_normalized_median'] is not None:
-                    _set_if_changed(self.prometheus_miner_gauges, m['activity_weighted_normalized_median'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "activity_weighted_normalized_median_sharpe")
+                    updates.append((miner_gauges, m['activity_weighted_normalized_median'], wallet_addr, netuid, agentId, "activity_weighted_normalized_median_sharpe"))
                 if m['sharpe_penalty'] is not None:
-                    _set_if_changed(self.prometheus_miner_gauges, m['sharpe_penalty'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "sharpe_penalty")
+                    updates.append((miner_gauges, m['sharpe_penalty'], wallet_addr, netuid, agentId, "sharpe_penalty"))
                 if m['sharpe_score'] is not None:
-                    _set_if_changed(self.prometheus_miner_gauges, m['sharpe_score'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "sharpe_score")
+                    updates.append((miner_gauges, m['sharpe_score'], wallet_addr, netuid, agentId, "sharpe_score"))
             else:
                 try:
-                    self.prometheus_miner_gauges.remove(self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "sharpe")
+                    miner_gauges.remove(wallet_addr, netuid, agentId, "sharpe")
                 except KeyError:
                     pass
 
-            _set_if_changed(self.prometheus_miner_gauges, m['unnormalized_score'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "unnormalized_score")
-            _set_if_changed(self.prometheus_miner_gauges, m['score'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "score")
-            _set_if_changed(self.prometheus_miner_gauges, m['placement'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "placement")
+            updates.append((miner_gauges, m['unnormalized_score'], wallet_addr, netuid, agentId, "unnormalized_score"))
+            updates.append((miner_gauges, m['score'], wallet_addr, netuid, agentId, "score"))
+            updates.append((miner_gauges, m['placement'], wallet_addr, netuid, agentId, "placement"))
 
-            _set_if_changed(self.prometheus_miner_gauges, (self.metagraph.trust[agentId] if len(self.metagraph.trust) > agentId else 0.0), self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "trust")
-            _set_if_changed(self.prometheus_miner_gauges, (self.metagraph.consensus[agentId] if len(self.metagraph.consensus) > agentId else 0.0), self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "consensus")
-            _set_if_changed(self.prometheus_miner_gauges, (self.metagraph.incentive[agentId] if len(self.metagraph.incentive) > agentId else 0.0), self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "incentive")
-            _set_if_changed(self.prometheus_miner_gauges, (self.metagraph.emission[agentId] if len(self.metagraph.emission) > agentId else 0.0), self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "emission")
+            updates.append((miner_gauges, (self.metagraph.trust[agentId] if len(self.metagraph.trust) > agentId else 0.0), wallet_addr, netuid, agentId, "trust"))
+            updates.append((miner_gauges, (self.metagraph.consensus[agentId] if len(self.metagraph.consensus) > agentId else 0.0), wallet_addr, netuid, agentId, "consensus"))
+            updates.append((miner_gauges, (self.metagraph.incentive[agentId] if len(self.metagraph.incentive) > agentId else 0.0), wallet_addr, netuid, agentId, "incentive"))
+            updates.append((miner_gauges, (self.metagraph.emission[agentId] if len(self.metagraph.emission) > agentId else 0.0), wallet_addr, netuid, agentId, "emission"))
 
             if self.miner_stats[agentId]['requests'] >= 100:
-                _set_if_changed(self.prometheus_miner_gauges, self.miner_stats[agentId]['requests'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "requests")
-                _set_if_changed(self.prometheus_miner_gauges, self.miner_stats[agentId]['requests'] - self.miner_stats[agentId]['failures'] - self.miner_stats[agentId]['timeouts'] - self.miner_stats[agentId]['rejections'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "success")
-                _set_if_changed(self.prometheus_miner_gauges, self.miner_stats[agentId]['failures'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "failures")
-                _set_if_changed(self.prometheus_miner_gauges, self.miner_stats[agentId]['timeouts'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "timeouts")
-                _set_if_changed(self.prometheus_miner_gauges, self.miner_stats[agentId]['rejections'], self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "rejections")
-                _set_if_changed(self.prometheus_miner_gauges, (sum(self.miner_stats[agentId]['call_time']) / len(self.miner_stats[agentId]['call_time']) if len(self.miner_stats[agentId]['call_time']) > 0 else 0), self.wallet.hotkey.ss58_address, self.config.netuid, agentId, "call_time")
+                updates.append((miner_gauges, self.miner_stats[agentId]['requests'], wallet_addr, netuid, agentId, "requests"))
+                updates.append((miner_gauges, self.miner_stats[agentId]['requests'] - self.miner_stats[agentId]['failures'] - self.miner_stats[agentId]['timeouts'] - self.miner_stats[agentId]['rejections'], wallet_addr, netuid, agentId, "success"))
+                updates.append((miner_gauges, self.miner_stats[agentId]['failures'], wallet_addr, netuid, agentId, "failures"))
+                updates.append((miner_gauges, self.miner_stats[agentId]['timeouts'], wallet_addr, netuid, agentId, "timeouts"))
+                updates.append((miner_gauges, self.miner_stats[agentId]['rejections'], wallet_addr, netuid, agentId, "rejections"))
+                updates.append((miner_gauges, (sum(self.miner_stats[agentId]['call_time']) / len(self.miner_stats[agentId]['call_time']) if len(self.miner_stats[agentId]['call_time']) > 0 else 0), wallet_addr, netuid, agentId, "call_time"))
                 self.miner_stats[agentId] = {'requests': 0, 'timeouts': 0, 'failures': 0, 'rejections': 0, 'call_time': []}
 
             _set_if_changed_metric(
                 self.prometheus_miners,
                 1.0,
-                wallet=self.wallet.hotkey.ss58_address,
-                netuid=self.config.netuid,
+                wallet=wallet_addr,
+                netuid=netuid,
                 agent_id=agentId,
                 timestamp=self.simulation_timestamp,
                 timestamp_str=duration_from_timestamp(self.simulation_timestamp),
@@ -735,10 +935,44 @@ async def report(self: 'Validator') -> None:
                 score=m['score'],
                 miner_gauge_name='miners'
             )
-
-        bt.logging.debug(f"Miner and metagraph metrics published ({time.time()-start:.4f}s).")
+        bt.logging.debug(f"Miner metrics collected ({time.time()-start:.4f}s).")
+        
+        bt.logging.info(f"Applying {len(updates)} metric updates...")
+        apply_start = time.time()
+        for update in updates:
+            _set_if_changed(*update)
+        bt.logging.info(f"Applied {len(updates)} updates in {time.time()-apply_start:.4f}s")
+        
         bt.logging.info(f"Metrics Published for Step {report_step} ({time.time()-report_start}s).")
     except Exception as ex:
         self.pagerduty_alert(f"Unable to publish metrics : {ex}", details={"traceback": traceback.format_exc()})
     finally:
         self.shared_state_reporting = False
+        
+if __name__ == '__main__':
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    bt.wallet.add_args(parser)
+    bt.subtensor.add_args(parser)
+    bt.logging.add_args(parser)
+    bt.logging.set_info()
+    
+    parser.add_argument('--netuid', type=int, default=1)
+    parser.add_argument('--logging.level', type=str, default="info")
+    parser.add_argument('--prometheus.port', type=int, default=9001)
+    parser.add_argument('--prometheus.level', type=str, default='INFO')
+    
+    config = bt.config(parser)
+    bt.logging(config=config)
+    
+    service = ReportingService(config)
+    
+    try:
+        asyncio.run(service.run())
+    except KeyboardInterrupt:
+        bt.logging.info("Reporting service stopped by user")
+    except Exception as e:
+        bt.logging.error(f"Reporting service crashed: {e}")
+        bt.logging.error(traceback.format_exc())
+        sys.exit(1)

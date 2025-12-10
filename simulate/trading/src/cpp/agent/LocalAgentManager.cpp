@@ -10,6 +10,7 @@
 #include "StylizedTraderAgent.hpp"
 #include "HighFrequencyTraderAgent.hpp"
 #include "FuturesTraderAgent.hpp"
+#include "NoiseTraderAgent.hpp"
 #include "RandomTraderAgent.hpp"
 
 #include <cassert>
@@ -54,6 +55,9 @@ void LocalAgentManager::createAgentsInstanced(
         }
         else if (name == "FuturesTraderAgent") {
             createAgentInstanced<FuturesTraderAgent>(child);
+        } 
+        else if (name == "NoiseTraderAgent") {
+            createAgentInstanced<taosim::agent::NoiseTraderAgent>(child);
         }
         else if (name == "RandomTraderAgent") {
             createAgentInstanced<taosim::agent::RandomTraderAgent>(child);

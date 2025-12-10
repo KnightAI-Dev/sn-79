@@ -145,6 +145,7 @@ private:
     void handleTrade(Message::Ptr msg);
     void handleWakeup(Message::Ptr msg);
     void handleMarketOrderResponse(Message::Ptr msg);
+    void handleMarketOrderPlacementErrorResponse(Message::Ptr msg);
     void handleBookResponse(Message::Ptr msg);
     void handleL1Response(Message::Ptr msg);
 
@@ -155,6 +156,7 @@ private:
     double wakeupProb(ALGOTraderState& state, double fundDist);
     Timestamp orderPlacementLatency();
     Timestamp marketFeedLatency();
+    Timestamp decisionMakingDelay();
 
     std::mt19937* m_rng;
     std::string m_exchange;
@@ -171,7 +173,8 @@ private:
     std::vector<TopLevel> m_topLevel;
     std::normal_distribution<double> m_departureThreshold;
     VolatilityBounds m_volatilityBounds;
-    double m_durationProbCoef, m_deviationProbCoef;
+    double m_deviationProbCoef;
+    double m_timeActivationCoef;
     Timestamp m_period;
     size_t m_depth;
     std::normal_distribution<double> m_delay;

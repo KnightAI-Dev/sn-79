@@ -14,6 +14,7 @@ add_library(agent STATIC
     StylizedTraderAgent.cpp
     TradeLogAgent.cpp
     HighFrequencyTraderAgent.cpp
+    NoiseTraderAgent.cpp
     RandomTraderAgent.cpp
 )
 add_library(taosim::agent ALIAS agent)

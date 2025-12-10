@@ -74,7 +74,6 @@ void ALGOTraderVolumeStats::push_levels(Timestamp timestamp, std::vector<BookLev
         m_estimatedVol = m_omega + m_alpha * std::pow(logret,2) + m_beta * m_estimatedVol + m_gamma * m_variance;
         // online error recovery
         if (isnan(m_estimatedVol)) {
-            // fmt::println("Something went wrong {}",m_variance);
             m_estimatedVol = m_omega/(1-m_alpha-m_beta);
         }
     }
@@ -158,10 +157,6 @@ void ALGOTraderVolumeStats::push(TimestampedVolume timestampedVolume)
 
     if (timestampedVolume.timestamp < m_queue.top().timestamp) [[unlikely]] {
         // TODO add error recovery?
-        // throw std::runtime_error{fmt::format(
-            // "{}: Attempt adding volume {} with timestamp {} earlier than the top of the queue ({})",
-            // std::source_location::current().function_name(),
-            // timestampedVolume.volume, timestampedVolume.timestamp, m_queue.top().timestamp)};
     }
 
     const bool withinQueueWindow =
@@ -333,6 +328,7 @@ void ALGOTraderAgent::configure(const pugi::xml_node& node)
     m_topLevel = std::vector<TopLevel>(m_bookCount, TopLevel{});
 
     m_deviationProbCoef = node.attribute("wakeDeviationCoef").as_double(1.0);
+    m_timeActivationCoef = node.attribute("wakeupTimeCoef").as_double(86'400'000'000'000.0);
 }
 
 //-------------------------------------------------------------------------
@@ -350,6 +346,9 @@ void ALGOTraderAgent::receiveMessage(Message::Ptr msg)
     }
     else if (msg->type == "RESPONSE_PLACE_ORDER_MARKET") {
         handleMarketOrderResponse(msg);
+    }
+    else if (msg->type == "ERROR_RESPONSE_PLACE_ORDER_MARKET") {
+        handleMarketOrderPlacementErrorResponse(msg);
     }
     else if (msg->type == "RESPONSE_RETRIEVE_L2") {
         handleBookResponse(msg);
@@ -503,14 +502,11 @@ void ALGOTraderAgent::handleWakeup(Message::Ptr msg)
                 MessagePayload::create<RetrieveL1Payload>(bookId));
         } 
     }
-    const Timestamp delay = static_cast<Timestamp>(std::min(
-            std::abs(m_delay(*m_rng)),
-            m_delay.mean()
-            + 3.0 * m_delay.stddev()));
+
 
     simulation()->dispatchMessage(
             simulation()->currentTimestamp(),
-            delay,
+            decisionMakingDelay(),
             name(),
             name(),
             "WAKEUP_ALGOTRADER");  
@@ -538,12 +534,25 @@ void ALGOTraderAgent::handleMarketOrderResponse(Message::Ptr msg)
         state.marketFeedLatency = marketFeedLatency();
         simulation()->dispatchMessage(
             simulation()->currentTimestamp(),
-            state.marketFeedLatency,
+            state.marketFeedLatency + decisionMakingDelay(),
             name(),
             m_exchange,
             "RETRIEVE_L1",
             MessagePayload::create<RetrieveL1Payload>(bookId));
     }
+}
+
+//-------------------------------------------------------------------------
+
+void ALGOTraderAgent::handleMarketOrderPlacementErrorResponse(Message::Ptr msg)
+{
+    const auto payload =
+        std::dynamic_pointer_cast<PlaceOrderMarketErrorResponsePayload>(msg->payload);
+
+    const BookId bookId = payload->requestPayload->bookId;
+
+    auto& state = m_state.at(bookId);
+    execute(bookId,state);
 }
 //-------------------------------------------------------------------------
 
@@ -582,12 +591,13 @@ double ALGOTraderAgent::wakeupProb(ALGOTraderState& state, double fundDist){
         (1 + std::exp(m_volatilityBounds.activationRate*(state.volumeStats.estimatedVolatility() -  m_volatilityBounds.activationMidpoint)));
     double slope = state.direction == OrderDirection::BUY ? state.volumeStats.askSlope() : state.volumeStats.bidSlope();
     double volume = state.direction == OrderDirection::BUY ? state.volumeStats.askVolume() : state.volumeStats.bidVolume();
-    double probCost = 1/(1+std::exp(2*((slope - volume*0.2)/slope)));
-    double probTime = 1.0; 
+    double volumeEstimate = util::decimal2double(state.volumeToBeExecuted);
+    double fullCostEst = m_depth*slope > volumeEstimate ? 1.0 : 1+ std::max(0.01, (2*m_depth*slope - volumeEstimate)/volumeEstimate);
+    double probCost = std::min(1.0,1/(1+std::exp(2*((slope - volume*0.2)/slope))) * fullCostEst);
+    double probTime = (state.statusChangeTime == 0) ? 1.0 : std::min(1.0, (simulation()->currentTimestamp()- state.statusChangeTime)/m_timeActivationCoef); 
     double probDist = std::min(1.0,fundDist * m_deviationProbCoef); 
 
     double probability = probVolatility * probCost * probTime * probDist;
-    // redundant sanity check
     return std::min(1.0,std::max(probability,0.0));
 }
 
@@ -602,10 +612,13 @@ Timestamp ALGOTraderAgent::orderPlacementLatency() {
     return static_cast<Timestamp>(std::lerp(m_opl.min, m_opl.max, m_orderPlacementLatencyDistribution->sample(*m_rng)));
 }
 Timestamp ALGOTraderAgent::marketFeedLatency() {
-    return static_cast<Timestamp>(std::lerp(m_opl.min,
-            m_marketFeedLatencyDistribution.mean()  
-                + 3.0 * m_marketFeedLatencyDistribution.stddev(),
-            std::abs(m_marketFeedLatencyDistribution(*m_rng))));
+    return static_cast<Timestamp>(std::min(std::abs(m_marketFeedLatencyDistribution(*m_rng)),
+        m_marketFeedLatencyDistribution.mean() + 3.0 * m_marketFeedLatencyDistribution.stddev()));
+}
+
+Timestamp ALGOTraderAgent::decisionMakingDelay() {
+        return static_cast<Timestamp>(std::min(std::abs(m_delay(*m_rng)),
+            m_delay.mean() + 3.0 * m_delay.stddev()));
 }
 //-------------------------------------------------------------------------
 double ALGOTraderAgent::getProcessValue(BookId bookId, const std::string& name)

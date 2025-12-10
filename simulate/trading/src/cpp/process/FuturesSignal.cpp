@@ -16,11 +16,13 @@ FuturesSignal::FuturesSignal(
     uint64_t bookId,
     uint64_t seedInterval,
     double X0,
-    Timestamp updatePeriod) noexcept
+    Timestamp updatePeriod,
+    float lambda) noexcept
     : m_simulation{simulation},
       m_bookId{bookId},
       m_seedInterval{seedInterval},
-      m_value{X0}
+      m_value{X0},
+      m_lambda{lambda}
 {
     m_updatePeriod = updatePeriod;
     m_value = std::round(m_X0);
@@ -58,6 +60,10 @@ void FuturesSignal::update(Timestamp timestamp)
                     fmt::println("FuturesSignal::update : ERROR GETTING SEED FROM FILE - {}", exc.what());
                 }
                 if (count != m_last_count) {
+                    if (m_value > 0.0) {
+                        m_logReturn = std::log(seed/m_value);
+                        m_volumeFactor = std::min(2.0,std::exp(std::abs(m_logReturn)));
+                    }
                     m_value = seed;
                     m_valueSignal(m_value);
                     m_last_count = count;
@@ -82,20 +88,27 @@ void FuturesSignal::update(Timestamp timestamp)
 }
 
 //-------------------------------------------------------------------------
+double FuturesSignal::volumeFactor() {
+    m_factorCounter++;
+    m_volumeFactor =  m_volumeFactor*std::exp(-m_lambda*m_factorCounter);
+    return m_volumeFactor;
+}
+
+//-------------------------------------------------------------------------
 
 void FuturesSignal::checkpointSerialize(
     rapidjson::Document& json, const std::string& key) const
 {
-    auto serialize = [this](rapidjson::Document& json) {
-        json.SetObject();
-        auto& allocator = json.GetAllocator();
-        json.AddMember("name", rapidjson::Value{"external", allocator}, allocator);
-        json.AddMember("bookId", rapidjson::Value{m_bookId}, allocator);
-        json.AddMember("seedInterval", rapidjson::Value{m_seedInterval}, allocator);
-        json.AddMember("X0", rapidjson::Value{m_X0}, allocator);
-        json.AddMember("value", rapidjson::Value{m_value}, allocator);
-    };
-    taosim::json::serializeHelper(json, key, serialize);
+    // auto serialize = [this](rapidjson::Document& json) {
+    //     json.SetObject();
+    //     auto& allocator = json.GetAllocator();
+    //     json.AddMember("name", rapidjson::Value{"external", allocator}, allocator);
+    //     json.AddMember("bookId", rapidjson::Value{m_bookId}, allocator);
+    //     json.AddMember("seedInterval", rapidjson::Value{m_seedInterval}, allocator);
+    //     json.AddMember("X0", rapidjson::Value{m_X0}, allocator);
+    //     json.AddMember("value", rapidjson::Value{m_value}, allocator);
+    // };
+    // taosim::json::serializeHelper(json, key, serialize);
 }
 
 //-------------------------------------------------------------------------
@@ -130,22 +143,23 @@ std::unique_ptr<FuturesSignal> FuturesSignal::fromXML(
         bookId,
         getNonNegativeUint64Attribute(node, "seedInterval"),
         X0,
-        node.attribute("updatePeriod").as_ullong(1));
+        getNonNegativeUint64Attribute(node , "updatePeriod"),
+        node.attribute("lambda").as_float(0.001155));
 }
 
 //-------------------------------------------------------------------------
 
-std::unique_ptr<FuturesSignal> FuturesSignal::fromCheckpoint(
-    taosim::simulation::ISimulation* simulation, const rapidjson::Value& json, double X0)
-{
-    auto fp = std::make_unique<FuturesSignal>(
-        simulation,
-        json["bookId"].GetUint64(),
-        json["seedInterval"].GetUint64(),
-        X0,
-        1);
-    fp->m_value = json["value"].GetDouble();
-    return fp;
-}
+// std::unique_ptr<FuturesSignal> FuturesSignal::fromCheckpoint(
+    // taosim::simulation::ISimulation* simulation, const rapidjson::Value& json, double X0)
+// {
+    // auto fp = std::make_unique<FuturesSignal>(
+    //     simulation,
+    //     json["bookId"].GetUint64(),
+    //     json["seedInterval"].GetUint64(),
+    //     X0,
+    //     1);
+    // fp->m_value = json["value"].GetDouble();
+    // return fp;
+// }
 
 //-------------------------------------------------------------------------

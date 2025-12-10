@@ -9,6 +9,7 @@
 #include "DistributionFactory.hpp"
 #include "RayleighDistribution.hpp"
 #include "Simulation.hpp"
+#include "FuturesSignal.hpp"
 
 #include <boost/algorithm/string/regex.hpp>
 #include <boost/bimap.hpp>
@@ -79,10 +80,6 @@ void FuturesTraderAgent::configure(const pugi::xml_node& node)
 
     attr = node.attribute("volume");
     m_volume = (attr.empty() || attr.as_double() <= 0.0) ? 1.0 : attr.as_double();
-    m_volumeFactor = std::vector<float>(m_bookCount,1.0);
-    m_factorCounter = std::vector<uint32_t>(m_bookCount, 0);
-    attr = node.attribute("lambda");
-    m_lambda = (attr.empty() || attr.as_float() <= 0.0) ? 0.01155 : attr.as_float();
 
     attr = node.attribute("tau");
     m_tau = (attr.empty() || attr.as_ullong() == 0) ? 120'000'000'000 : attr.as_ullong();
@@ -94,25 +91,6 @@ void FuturesTraderAgent::configure(const pugi::xml_node& node)
     m_lastUpdate = std::vector<Timestamp>(m_bookCount,0);
     
     m_orderFlag = std::vector<bool>(m_bookCount, false);
-
-    m_historySize = node.attribute("tauHist").as_ullong(200);
-
-    for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
-        m_priceHist.push_back([&] {
-            decltype(m_priceHist)::value_type hist{m_historySize};
-            for (uint32_t i = 0; i < m_historySize; ++i) {
-                hist.push_back(0.0);
-            }
-            return hist;
-        }());
-        m_logReturns.push_back([&] {
-            decltype(m_logReturns)::value_type logReturns{m_historySize};
-            for (uint32_t i = 0; i < m_historySize; ++i) {
-                logReturns.push_back(0.0);
-            }
-            return logReturns;
-        }());
-    }
 
     m_priceIncrement = 1 / std::pow(10, simulation()->exchange()->config().parameters().priceIncrementDecimals);
     m_volumeIncrement = 1 / std::pow(10, simulation()->exchange()->config().parameters().volumeIncrementDecimals);
@@ -139,6 +117,26 @@ void FuturesTraderAgent::configure(const pugi::xml_node& node)
             }
         }()
     };
+    m_decisionMakingDelayDistribution = std::normal_distribution<double>{
+        [&] {
+            static constexpr const char* name = "delayMean";
+            if (auto attr = node.attribute(name); attr.empty()) {
+                throw std::invalid_argument{fmt::format(
+                    "{}: Missing attribute '{}'", ctx, name)};
+            } else {
+                return attr.as_double();
+            }
+        }(),
+        [&] {
+            static constexpr const char* name = "delaySTD";
+            if (auto attr = node.attribute(name); attr.empty()) {
+                throw std::invalid_argument{fmt::format(
+                    "{}: Missing attribute '{}'", ctx, name)};
+            } else {
+                return attr.as_double();
+            }
+        }()
+    };
 
     m_tradePrice.resize(m_bookCount);
     
@@ -146,26 +144,18 @@ void FuturesTraderAgent::configure(const pugi::xml_node& node)
     const double scale = (attr.empty() || attr.as_double() == 0.0) ? 0.235 : attr.as_double();
     const double percentile = 1-std::exp(-1/(2*scale*scale));
     m_orderPlacementLatencyDistribution =  std::make_unique<taosim::stats::RayleighDistribution>(scale, percentile); 
-    
-
-    // m_rayleigh = std::make_unique<taosim::stats::RayleighDistribution>(
-    //     [&] {
-    //         static constexpr const char* name = "scaleR";
-    //         if (auto sigma = node.attribute(name).as_double(); !(sigma >= 0)) {
-    //             throw std::invalid_argument{fmt::format(
-    //                 "{}: Attribute '{}' should be >= 0, was {}", ctx, name, sigma)};
-    //         } else {
-    //             return sigma;
-    //         }
-    //     }()
-    // );
-
 
     m_baseName = [&] {
         std::string res = name();
         boost::algorithm::erase_regex(res, boost::regex("(_\\d+)$"));
         return res;
     }();
+
+    size_t pos = name().find_last_not_of("0123456789");
+    if (pos != std::string::npos && pos + 1 < name().size()) {
+        std::string numStr = name().substr(pos + 1);
+        m_catUId = static_cast<uint32_t>(std::stoul(numStr));
+    }
 }
 
 //-------------------------------------------------------------------------
@@ -199,6 +189,8 @@ void FuturesTraderAgent::receiveMessage(Message::Ptr msg)
     }
     else if (msg->type == "EVENT_TRADE") {
         handleTrade(msg);
+    } else if (msg->type == "WAKEUP") {
+        handleWakeup(msg);
     }
 }
 
@@ -223,19 +215,40 @@ void FuturesTraderAgent::handleSimulationStop()
 
 void FuturesTraderAgent::handleTradeSubscriptionResponse()
 {
-    for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
-        auto rng = std::mt19937{simulation()->currentTimestamp() + bookId};
-        simulation()->dispatchMessage(
-            simulation()->currentTimestamp(),
-            static_cast<Timestamp>(std::min(
-            std::abs(m_marketFeedLatencyDistribution(rng)),
-            m_marketFeedLatencyDistribution.mean()
-            + 3.0 * (m_marketFeedLatencyDistribution.stddev()))),
-            name(),
-            m_exchange,
-            "RETRIEVE_L1",
-            MessagePayload::create<RetrieveL1Payload>(bookId));
+    if (m_catUId == 0) {
+        for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
+
+            auto chosenAgent = selectTurn();
+
+            simulation()->dispatchMessage(
+                simulation()->currentTimestamp(),
+                marketFeedLatency(),
+                name(),
+                fmt::format("{}_{}", m_baseName, chosenAgent),
+                "WAKEUP",
+                MessagePayload::create<RetrieveL1Payload>(bookId));
+        }
     }
+}
+
+//-------------------------------------------------------------------------
+
+uint64_t FuturesTraderAgent::selectTurn() {
+    const auto& agentBaseNamesToCounts = simulation()->localAgentManager()->roster()->baseNamesToCounts();
+    return  std::uniform_int_distribution<uint64_t>{0, agentBaseNamesToCounts.at(m_baseName) - 1}(*m_rng);
+}
+
+//------------------------------------------------------------------------
+
+void FuturesTraderAgent::handleWakeup(Message::Ptr &msg)
+{
+    simulation()->dispatchMessage(
+        simulation()->currentTimestamp(),
+        marketFeedLatency(),
+        name(),
+        m_exchange,
+        "RETRIEVE_L1",
+        msg->payload);
 }
 
 //-------------------------------------------------------------------------
@@ -246,87 +259,22 @@ void FuturesTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 
     const BookId bookId = payload->bookId;
 
-    auto rng = std::mt19937{simulation()->currentTimestamp() + bookId};
+    uint64_t chosenOne = selectTurn();
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
-        static_cast<Timestamp>(std::min(
-            std::abs(m_marketFeedLatencyDistribution(rng)),
-            m_marketFeedLatencyDistribution.mean()
-            + 3.0 * (m_marketFeedLatencyDistribution.stddev()))),
+        marketFeedLatency(),
         name(),
-        m_exchange,
-        "RETRIEVE_L1",
+        fmt::format("{}_{}", m_baseName, chosenOne),
+        "WAKEUP",
         MessagePayload::create<RetrieveL1Payload>(bookId));
 
-    const uint64_t processCount = getProcessCount(bookId, "external");
-    if (processCount == 0 && m_priceHist.at(bookId).back() < 0.0001) {
-        const double newProcessValue = getProcessValue(bookId, "external");
-        m_priceHist.at(bookId).push_back(newProcessValue);  
-        return;
-    }
-    if (m_lastUpdate.at(bookId) != processCount) {
-        const double newProcessValue = getProcessValue(bookId, "external"); 
-        m_lastUpdate.at(bookId) = processCount;
-
-        const double lastProcessValue = m_priceHist.at(bookId).back();
-        if (lastProcessValue == 0) {
-            m_logReturns.at(bookId).push_back(0.0);
-        } else {
-            m_logReturns.at(bookId).push_back(std::log(newProcessValue / lastProcessValue));
-        }
-        m_volumeFactor.at(bookId) = std::min(2.0,std::exp(std::abs(m_logReturns.at(bookId).back())));
-        m_factorCounter.at(bookId) = 0;
-        m_priceHist.at(bookId).push_back(newProcessValue);
-    } else {
-        m_factorCounter.at(bookId) += 1;
-        m_volumeFactor.at(bookId) = m_volumeFactor.at(bookId)*std::exp(-m_lambda*m_factorCounter.at(bookId));
-    }
 
     if (m_orderFlag.at(bookId)) return;
     
 
-    const uint32_t numActingAgents = 1; 
-
-    const auto& agentBaseNamesToCounts =
-        simulation()->localAgentManager()->roster()->baseNamesToCounts();
-
-    const auto categoryIdToAgentType = [&] {
-        boost::bimap<uint32_t, std::string> res;
-        auto filteredBaseNames = agentBaseNamesToCounts
-            | views::keys
-            | views::filter([](const auto& baseName) { return baseName.contains("FUTURES_TRADER_AGENT"); });
-        for (const auto& [id, baseName] : views::enumerate(filteredBaseNames)) {
-            res.insert({static_cast<uint32_t>(id), baseName});
-        }
-        return res;
-    }();
-
-    auto multinomial = [&] {
-        const auto weights = agentBaseNamesToCounts
-            | views::filter([](const auto& kv) { return kv.first.contains("FUTURES_TRADER_AGENT"); })
-            | views::values
-            | ranges::to<std::vector>;
-        return std::discrete_distribution{weights.begin(), weights.end()};
-    }();
-
-    const auto categoryIdDraws =
-        views::iota(0u, numActingAgents)
-        | views::transform([&](auto) { return multinomial(rng); });
-
-    const auto actorIdsNonCanon =
-        categoryIdDraws
-        | views::transform([&](auto draw) {
-            return std::uniform_int_distribution<uint32_t>{
-                0, agentBaseNamesToCounts.at(categoryIdToAgentType.left.at(draw)) - 1}(rng);
-        });
-
-    for (auto [categoryId, actorId] : views::zip(categoryIdDraws, actorIdsNonCanon)) {
-        if (categoryIdToAgentType.right.at(m_baseName) != categoryId) continue;
-        if (!name().ends_with(fmt::format("_{}", actorId))) continue;
-        const double bestBid = taosim::util::decimal2double(payload->bestBidPrice);
-        const double bestAsk = taosim::util::decimal2double(payload->bestAskPrice);
-        placeOrder(bookId, bestAsk, bestBid);
-    }    
+    const double bestBid = taosim::util::decimal2double(payload->bestBidPrice);
+    const double bestAsk = taosim::util::decimal2double(payload->bestAskPrice);
+    placeOrder(bookId, bestAsk, bestBid);
 }
 
 //-------------------------------------------------------------------------
@@ -406,30 +354,32 @@ void FuturesTraderAgent::handleTrade(Message::Ptr msg)
 
 void FuturesTraderAgent::placeOrder(BookId bookId, double bestAsk, double bestBid)
 {
-    const double logReturn = m_logReturns.at(bookId).back();
-    if (logReturn == 0) return;
+    const auto futuresDetails = getProcessDetails(bookId, "external");
+    const double logReturn = futuresDetails.logReturn; 
+    if (logReturn == 0.0 || futuresDetails.volumeFactor == 0.0) return;
     const double sign = logReturn < 0.0 ? -1.0 : 1.0;
     const double epsilon = std::normal_distribution{0.0, m_sigmaEps}(*m_rng);
     const double forecast =  sign + epsilon;
-    const float newMean = std::log(m_volume) * m_volumeFactor.at(bookId);
+    
+    const float newMean = std::log(m_volume) * futuresDetails.volumeFactor;
     std::lognormal_distribution<> lognormalDist(newMean, 1); 
     double volume = lognormalDist(*m_rng);
+    const double priceShift =  volume > 1.0 ? std::floor(volume)*m_priceIncrement : -1*std::floor(volume/m_priceIncrement)*m_priceIncrement;
     volume =  std::floor(volume / m_volumeIncrement) * m_volumeIncrement;
-    const double priceShift = std::round((newMean - volume) / 1) * m_priceIncrement;
     if (volume == 0) return;
     const bool draw = std::bernoulli_distribution{m_orderTypeProb}(*m_rng);
     if (forecast > 0) {
         if (draw) {
             placeBuy(bookId, volume);
         } else {
-            placeBid(bookId, volume, bestBid + priceShift);
+            placeBid(bookId, volume, bestBid - priceShift);
         }
     }
     else if (forecast < 0) {
         if (draw) {
             placeSell(bookId, volume);
         } else {
-            placeAsk(bookId, volume, bestAsk - priceShift);
+            placeAsk(bookId, volume, bestAsk + priceShift);
         }
     }
 }
@@ -509,7 +459,17 @@ void FuturesTraderAgent::placeSell(BookId bookId, double volume)
 Timestamp FuturesTraderAgent::orderPlacementLatency() {
     return static_cast<Timestamp>(std::lerp(m_opl.min, m_opl.max, m_orderPlacementLatencyDistribution->sample(*m_rng)));
 }
-
+//-------------------------------------------------------------------------
+Timestamp FuturesTraderAgent::marketFeedLatency() {
+    return static_cast<Timestamp>(std::min(std::abs(m_marketFeedLatencyDistribution(*m_rng)),
+            +m_marketFeedLatencyDistribution.mean() + 3 * m_marketFeedLatencyDistribution.stddev()));
+}
+//-------------------------------------------------------------------------
+Timestamp FuturesTraderAgent::decisionMakingDelay() {
+    return static_cast<Timestamp>(std::min(std::abs(m_decisionMakingDelayDistribution(*m_rng)),
+             m_decisionMakingDelayDistribution.mean()
+            + 3.0 * m_decisionMakingDelayDistribution.stddev()));
+}
 //-------------------------------------------------------------------------
 
 double FuturesTraderAgent::getProcessValue(BookId bookId, const std::string& name)
@@ -517,9 +477,12 @@ double FuturesTraderAgent::getProcessValue(BookId bookId, const std::string& nam
     return simulation()->exchange()->process(name, bookId)->value();
 }
 
+
 //-------------------------------------------------------------------------
-uint64_t FuturesTraderAgent::getProcessCount(BookId bookId, const std::string& name)
+FuturesTraderAgent::FuturesDetails FuturesTraderAgent::getProcessDetails(BookId bookId, const std::string& name)
 {
-    return simulation()->exchange()->process(name, bookId)->count();
+    const auto externalProcess = dynamic_cast<FuturesSignal*>(simulation()->exchange()->process(name,bookId));
+    return {.logReturn = externalProcess->logReturn(), .volumeFactor = externalProcess->volumeFactor()};
 }
+
 //-------------------------------------------------------------------------

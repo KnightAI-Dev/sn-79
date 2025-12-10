@@ -25,11 +25,14 @@ public:
         uint64_t bookId,
         uint64_t seedInterval,
         double X0,
-        Timestamp updatePeriod) noexcept;
+        Timestamp updatePeriod,
+        float lambda) noexcept;
 
     virtual void update(Timestamp timestamp) override;
-    virtual double value() const override { return m_value; };
-    virtual uint64_t count() const override { return m_last_count; };
+    virtual double value() const override {return m_value; } 
+    double logReturn() {return m_logReturn; }
+    double volumeFactor();
+    virtual uint64_t count() const override { return m_last_count; }
     virtual void checkpointSerialize(
         rapidjson::Document& json, const std::string& key = {}) const override;
 
@@ -43,8 +46,12 @@ private:
     uint64_t m_bookId;
     uint64_t m_seedInterval;
     std::string m_seedfile;
-    double m_X0; //, m_mu, m_sigma, m_dt;
+    double m_X0; 
     double m_value;
+    double m_logReturn = 0.0;
+    double m_volumeFactor = 2.0;
+    uint32_t m_factorCounter = 0;
+    float m_lambda;
     uint64_t m_last_count = 0;
     double m_last_seed = 0;
     Timestamp m_last_seed_time = 0;

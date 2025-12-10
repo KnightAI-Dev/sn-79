@@ -249,7 +249,7 @@ class MarketSimulationConfig(BaseModel):
     hft_agent_order_latency_max : int
     hft_agent_order_latency_scale : float
 
-    hft_agent_tau : int
+    hft_agent_tau : float
     hft_agent_delta : int
     hft_agent_psi : float
     hft_agent_gHFT : float
@@ -381,7 +381,7 @@ class MarketSimulationConfig(BaseModel):
             hft_agent_order_latency_max = int(HFT_config.attrib['maxOPLatency']),
             hft_agent_order_latency_scale = float(HFT_config.attrib['opLatencyScaleRay']),
 
-            hft_agent_tau = int(HFT_config.attrib['tau']),
+            hft_agent_tau = float(HFT_config.attrib['tau']),
             hft_agent_delta = int(HFT_config.attrib['delta']),
             hft_agent_psi = float(HFT_config.attrib['psiHFT_constant']),
             hft_agent_gHFT = float(HFT_config.attrib['gHFT']),
@@ -404,7 +404,7 @@ class MarketSimulationConfig(BaseModel):
             sta_agent_order_latency_scale = float(STA_config.attrib['opLatencyScaleRay']),
             sta_agent_decision_latency_mean = int(STA_config.attrib['delayMean']),
             sta_agent_decision_latency_std = int(STA_config.attrib['delaySTD']),
-            sta_agent_selection_scale = float(STA_config.attrib['scaleR']),
+            sta_agent_selection_scale = float(STA_config.attrib['scaleR'] if 'scaleR' in STA_config.attrib else 0.0),
 
             sta_agent_noise_weight = float(STA_config.attrib['sigmaN']),
             sta_agent_chartist_weight = float(STA_config.attrib['sigmaC']),
@@ -412,7 +412,7 @@ class MarketSimulationConfig(BaseModel):
 
             sta_agent_tau = int(STA_config.attrib['tau']),
             sta_agent_tauHist = int(STA_config.attrib['tauHist']),
-            sta_agent_tauF = int(STA_config.attrib['tau']),
+            sta_agent_tauF = int(STA_config.attrib['tauF']),
             sta_agent_sigmaEps = float(STA_config.attrib['sigmaEps']),
             sta_agent_r_aversion = float(STA_config.attrib['r_aversion']),
 
@@ -424,12 +424,12 @@ class MarketSimulationConfig(BaseModel):
 
             futures_agent_volume = float(Futures_config.attrib['volume']),
             futures_agent_sigmaEps = float(Futures_config.attrib['sigmaEps']),
-            futures_agent_lambda = float(Futures_config.attrib['lambda']),
+            futures_agent_lambda = float(Futures_config.attrib['lambda'] if 'lambda' in Futures_config.attrib else 0.0),
             futures_agent_feed_latency_mean = int(Futures_config.attrib['MFLmean']),
             futures_agent_feed_latency_std = int(Futures_config.attrib['MFLstd']),
             futures_agent_order_latency_min = int(Futures_config.attrib['minOPLatency']),
             futures_agent_order_latency_max = int(Futures_config.attrib['maxOPLatency']),
-            futures_agent_selection_scale = float(Futures_config.attrib['scaleR']),
+            futures_agent_selection_scale = float(Futures_config.attrib['scaleR'] if 'scaleR' in Futures_config.attrib else 0.0),
         )
 
     def label(self) -> str:

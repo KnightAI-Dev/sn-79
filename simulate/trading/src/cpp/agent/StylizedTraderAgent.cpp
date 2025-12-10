@@ -26,7 +26,7 @@
 
 
 inline auto investmentPosition = [](double price, double forecast, double variance, double base, double quote, double risk, double constant) {
-    return std::log(forecast/price)/(variance*price) * (1/risk * (base*price + quote) + constant);
+    return std::log(forecast/price)/variance * (1/risk * (base + quote/price) + constant/price);
 };    
 
 namespace br = boost::random;
@@ -80,11 +80,19 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
         .N = std::abs(br::laplace_distribution{sigmaN, sigmaN}(*m_rng))
     };
     m_weightNormalizer = 1.0f / (m_weight.F + m_weight.C + m_weight.N);
+    if (isnan(m_weightNormalizer)) {
+         throw std::invalid_argument(fmt::format(
+            "{}: attribute 'weightDraw error'", ctx));
+    }
 
     m_priceF0 = simulation()->exchange()->process("fundamental", BookId{})->value();
 
     m_price0 = taosim::util::decimal2double(simulation()->exchange()->config2().initialPrice);
-
+    
+    if (attr = node.attribute("tauF"); attr.empty() || attr.as_double() <= 0.0) {
+            throw std::invalid_argument(fmt::format(
+            "{}: attribute 'tauF' should have a value greater than 0.0", ctx));
+    }
     m_tauF = std::vector<double>(m_bookCount, attr.as_double()); 
     m_tauFOrig = attr.as_double();
 
@@ -99,7 +107,7 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
         throw std::invalid_argument(fmt::format(
             "{}: attribute 'r_aversion' should have a value greater than 0.0f", ctx));
     }
-    // NOTE Modified inserted parameter is the one we want as the average!
+    
     m_riskAversion0 = attr.as_double();
     const double riskAversionCoef = m_riskAversion0* (1.0f + sigmaC)/(1.0f + sigmaF);
     m_riskAversion = riskAversionCoef * (1.0f + m_weight.F) / (1.0f + m_weight.C);
@@ -234,11 +242,12 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
             "{}: attribute 'tau' should have a value greater than 0", ctx));
     }
     m_tau0 = attr.as_ullong();
-    const double tauCoef = (m_tau0 *(m_decisionMakingDelayDistribution.mean() + m_marketFeedLatencyDistribution.mean())) * (1.0f + sigmaC)/(1.0f + sigmaF);
-    m_tau = std::min(
+    const double tauCoef = (m_tau0* (1.0f + sigmaC)/(1.0f + sigmaF));
+    m_tau = std::clamp(
         static_cast<Timestamp>(std::ceil(
-            tauCoef * (1.0f + m_weight.F) / (1.0f + m_weight.C))),
-        simulation()->duration() - 1);
+            tauCoef * (1.0f + m_weight.F) / (1.0f + m_weight.C))),static_cast<Timestamp>(1'000'000'000),
+        static_cast<Timestamp>(3'600'000'000'000));
+    
     if (attr = node.attribute("tauF"); attr.empty() || attr.as_double() == 0.0) {
         throw std::invalid_argument(fmt::format(
             "{}: attribute 'tauF' should have a value greater than 0.0", ctx));
@@ -251,9 +260,11 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
     }
 
     m_tauHist = attr.as_ullong();
-    const Timestamp averageStepsCoef = static_cast<Timestamp>( m_tau0 * (1.0f + sigmaC)/(1.0f + sigmaF)); 
-    m_historySize = std::max(
-        static_cast<Timestamp>(std::ceil(averageStepsCoef* (1.0 + m_weight.F) / (1.0 + m_weight.C))), m_tauHist);
+    const Timestamp averageStepsCoef = static_cast<Timestamp>( m_tauHist * (1.0f + sigmaC)/(1.0f + sigmaF)); 
+    m_historySize = std::clamp(static_cast<Timestamp>(std::ceil(averageStepsCoef* (1.0 + m_weight.F) / (1.0 + m_weight.C))),
+                        static_cast<Timestamp>(10), // min
+                        static_cast<Timestamp>(1000) // max
+                );
     attr = node.attribute("GBM_X0");
     const double gbmX0 = (attr.empty() || attr.as_double() <= 0.0f) ?  0.001 : attr.as_double();
     attr = node.attribute("GBM_mu");
@@ -265,44 +276,52 @@ void StylizedTraderAgent::configure(const pugi::xml_node& node)
 
     for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
         m_topLevel.push_back(TopLevel{});
-        GBMValuationModel gbmPrice{gbmX0, gbmMu, gbmSigma, gbmSeed + bookId + 1};
-        const auto Xt = gbmPrice.generatePriceSeries(1, m_historySize);
+        GBMValuationModel gbmPrice{m_price0, gbmMu, gbmSigma, gbmSeed + bookId + 1};
+        const auto Xt = gbmPrice.generatePriceSeries(1, 86400);
+        double price = Xt[86400-1];
+        
+        uint64_t stepLen = m_tau / 1'000'000'000;
         m_priceHist.push_back([&] {
             decltype(m_priceHist)::value_type hist{m_historySize};
-            for (uint32_t i = 0; i < m_historySize; ++i) {
-                hist.push_back(m_price0 * (1.0 + Xt[i]));
+            for (uint32_t i = 1; i < 86400; i += stepLen) {
+                price = Xt[86400-i];
+                hist.push_back(price);
             }
             return hist;
         }());
         m_logReturns.push_back([&] {
             decltype(m_logReturns)::value_type logReturns{m_historySize};
             const auto& priceHist = m_priceHist.at(bookId);
-            logReturns.push_back(Xt[0]);
-            for (uint32_t i = 1; i < priceHist.capacity(); ++i) {
-                logReturns.push_back(std::log(priceHist[i] / priceHist[i - 1]));
+            logReturns.push_back(0.0);
+            for (uint32_t i = 1; i < priceHist.size(); ++i) {
+                if (priceHist[i-1] == 0 || isnan(priceHist[i])) {
+                    logReturns.push_back(0.0);
+                } else {
+                    logReturns.push_back(std::log(priceHist[i] / priceHist[i - 1]));
+                }
             }
             return logReturns;
         }());
     }
 
-    m_tradePrice.resize(m_bookCount);
+    m_tradePrice = std::vector<TimestampedTradePrice>(m_bookCount, TimestampedTradePrice{.timestamp=0,.price=m_price0}); 
     attr = node.attribute("opLatencyScaleRay"); 
     const double scale = (attr.empty() || attr.as_double() == 0.0) ? 0.235 : attr.as_double();
     const double percentile = 1-std::exp(-1/(2*scale*scale));
     m_orderPlacementLatencyDistribution =  std::make_unique<taosim::stats::RayleighDistribution>(scale, percentile); 
 
-    if (attr = node.attribute("scaleR"); attr.empty() || attr.as_double() <= 0.0) {
-            throw std::invalid_argument{fmt::format(
-                    "{}: Attribute 'scaleR' should be >= 0, was {}", ctx, attr.as_double())};
-    } 
-    const double scaleR = attr.as_double();
-    m_rayleigh = std::make_unique<taosim::stats::RayleighDistribution>(scaleR);
 
     m_baseName = [&] {
         std::string res = name();
         boost::algorithm::erase_regex(res, boost::regex("(_\\d+)$"));
         return res;
     }();
+
+    size_t pos = name().find_last_not_of("0123456789");
+    if (pos != std::string::npos && pos + 1 < name().size()) {
+        std::string numStr = name().substr(pos + 1);
+        m_catUId = static_cast<uint64_t>(std::stoul(numStr));
+    }
 
 }
 
@@ -336,6 +355,8 @@ void StylizedTraderAgent::receiveMessage(Message::Ptr msg)
     }
     else if (msg->type == "EVENT_TRADE") {
         handleTrade(msg);
+    } else if (msg->type == "WAKEUP") {
+        handleWakeup(msg);
     }
 }
 
@@ -360,7 +381,7 @@ void StylizedTraderAgent::handleSimulationStop()
 
 void StylizedTraderAgent::handleTradeSubscriptionResponse()
 {
-    for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
+   for (BookId bookId = 0; bookId < m_bookCount; ++bookId) {
         simulation()->dispatchMessage(
             simulation()->currentTimestamp(),
             1,
@@ -368,6 +389,17 @@ void StylizedTraderAgent::handleTradeSubscriptionResponse()
             m_exchange,
             "RETRIEVE_L1",
             MessagePayload::create<RetrieveL1Payload>(bookId));
+        if (m_catUId == 0) {
+            auto chosenAgent = selectTurn();
+            Timestamp initDelay = marketFeedLatency(); 
+            simulation()->dispatchMessage(
+            simulation()->currentTimestamp(),
+                initDelay,
+                name(),
+                fmt::format("{}_{}", m_baseName, chosenAgent),
+                "WAKEUP",
+                MessagePayload::create<RetrieveL1Payload>(bookId));  
+        }
     }
 }
 
@@ -383,13 +415,7 @@ void StylizedTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
-        static_cast<Timestamp>(std::min(
-            std::abs(m_marketFeedLatencyDistribution(rng))
-            + std::abs(m_decisionMakingDelayDistribution(rng)),
-            m_marketFeedLatencyDistribution.mean()
-            + m_decisionMakingDelayDistribution.mean()
-            + 3.0 * (m_marketFeedLatencyDistribution.stddev()
-                + m_decisionMakingDelayDistribution.stddev()))),
+        marketFeedLatency() + m_tau,
         name(),
         m_exchange,
         "RETRIEVE_L1",
@@ -409,78 +435,6 @@ void StylizedTraderAgent::handleRetrieveL1Response(Message::Ptr msg)
     m_logReturns.at(bookId).push_back(
                     std::log(lastPrice / m_priceHist.at(bookId).back()));
     m_priceHist.at(bookId).push_back(lastPrice);
-
-    const double askVol = taosim::util::decimal2double(payload->askTotalVolume);
-    const double bidVol = taosim::util::decimal2double(payload->bidTotalVolume);
-    const float volumeImbalance = (bidVol- askVol)/(bidVol + askVol);
-
-    if (m_regimeState.at(bookId) == RegimeState::NORMAL && std::bernoulli_distribution{std::abs(volumeImbalance)}(rng)) {
-        m_regimeChangeProb.at(bookId) = std::abs(volumeImbalance);
-        updateRegime(bookId);
-    } else if (m_regimeState.at(bookId) == RegimeState::REGIME_A) {
-        updateRegime(bookId);
-    }
-
-    if (m_orderFlag.at(bookId)) return;
-
-    
-    auto linspace = [](double start, double stop, int num) -> std::vector<double> {
-        if (!(num > 1)) {
-            throw std::invalid_argument{fmt::format(
-                "{}: parameter 'num' should be > 1, was {}",
-                std::source_location::current().function_name(), num)};
-        }
-        const double step = (stop - start) / (num - 1);
-        return views::iota(0, num)
-            | views::transform([=](int k) { return start + k * step; })
-            | ranges::to<std::vector>;
-    };
-
-    const uint32_t numActingAgents = [&] {
-        const double rayleighDraw = m_rayleigh->sample(rng); 
-        const auto bins = linspace(0.0, 5.0, 10);
-        return std::upper_bound(bins.begin(), bins.end(), rayleighDraw) - bins.begin() - 1;
-    }();
-
-    const auto& agentBaseNamesToCounts =
-        simulation()->localAgentManager()->roster()->baseNamesToCounts();
-
-    const auto categoryIdToAgentType = [&] {
-        boost::bimap<uint32_t, std::string> res;
-        auto filteredBaseNames = agentBaseNamesToCounts
-            | views::keys
-            | views::filter([](const auto& baseName) { return baseName.contains("STYLIZED_TRADER_AGENT"); });
-        for (const auto& [id, baseName] : views::enumerate(filteredBaseNames)) {
-            res.insert({static_cast<uint32_t>(id), baseName});
-        }
-        return res;
-    }();
-
-    auto multinomial = [&] {
-        const auto weights = agentBaseNamesToCounts
-            | views::filter([](const auto& kv) { return kv.first.contains("STYLIZED_TRADER_AGENT"); })
-            | views::values
-            | ranges::to<std::vector>;
-        return std::discrete_distribution{weights.begin(), weights.end()};
-    }();
-
-    const auto categoryIdDraws =
-        views::iota(0u, numActingAgents)
-        | views::transform([&](auto) { return multinomial(rng); });
-
-    const auto actorIdsNonCanon =
-        categoryIdDraws
-        | views::transform([&](auto draw) {
-            return std::uniform_int_distribution<uint32_t>{
-                0, agentBaseNamesToCounts.at(categoryIdToAgentType.left.at(draw)) - 1}(rng);
-        });
-
-    for (auto [categoryId, actorId] : views::zip(categoryIdDraws, actorIdsNonCanon)) {
-        if (categoryIdToAgentType.right.at(m_baseName) != categoryId) continue;
-        if (!name().ends_with(fmt::format("_{}", actorId))) continue;
-        m_price = spotPrice;
-        placeOrderChiarella(bookId);
-    }
 }
 
 //-------------------------------------------------------------------------
@@ -491,7 +445,7 @@ void StylizedTraderAgent::handleLimitOrderPlacementResponse(Message::Ptr msg)
 
     simulation()->dispatchMessage(
         simulation()->currentTimestamp(),
-        m_tau,
+        static_cast<Timestamp>(m_tau*std::max(1.0,std::log(m_historySize))),
         name(),
         m_exchange,
         "CANCEL_ORDERS",
@@ -542,26 +496,45 @@ StylizedTraderAgent::ForecastResult StylizedTraderAgent::forecast(BookId bookId)
     const double pf = getProcessValue(bookId, "fundamental");
 
     m_price = m_priceHist.at(bookId).back();
+    if (isnan(m_price) || m_price <= 0.0) {
+        m_price = m_tradePrice.at(bookId).price;
+    }
     const auto& logReturns = m_logReturns.at(bookId);
-    const double compF =  1.0 / m_tauF.at(bookId) * std::log(pf/ m_price);
-    const double compC = 1.0 / m_historySize * ranges::accumulate(logReturns, 0.0);
+    double compF =  1.0 / m_tauF.at(bookId) * std::log(pf/ m_price);
+    // Error recovery, just in case
+    if (isnan(compF)) {
+        compF = 0.0;
+    }
+    double compC = 1.0 / m_historySize * ranges::accumulate(logReturns, 0.0);
+    if (isnan(compC)) {
+        if (logReturns.front() != logReturns.back()){
+            compC = (logReturns.front() + logReturns.back())*0.5;
+        } else {
+            compC = 0.0;
+        }
+    }
     const double compN = std::normal_distribution{0.0, m_sigmaEps}(*m_rng);
-    const double tauFNormalizer = m_regimeState.at(bookId) == RegimeState::REGIME_A ?  m_tauF.at(bookId) / m_weightNormalizer *0.01 : 1;
-    const double logReturnForecast = m_weightNormalizer
-        * (m_weight.F * compF + m_weight.C * compC + m_weight.N * compN) * tauFNormalizer;
-    const double varLastLogs = [&] {
+    // const double tauFNormalizer = m_regimeState.at(bookId) == RegimeState::REGIME_A ?  m_tauF.at(bookId) / m_weightNormalizer *0.01 : 1;
+    double logReturnForecast = std::clamp(m_weightNormalizer
+        * (m_weight.F * compF + m_weight.C * compC + m_weight.N * compN), -1.0, 1.0);// * tauFNormalizer;
+    double varLastLogs = [&] {
             namespace bacc = boost::accumulators;
             bacc::accumulator_set<double, bacc::stats<bacc::tag::lazy_variance>> acc;
-            const auto n = logReturns.capacity();
+            const auto n = logReturns.size();
             for (auto logRet : logReturns) {
                 acc(logRet);
             }
             return bacc::variance(acc) * (n - 1) / n;
         }();
-    
-   
+    // Error recovery
+    if (isnan(varLastLogs)) {
+        varLastLogs = std::abs(std::log(pf/m_price)*0.33);
+    }
+    if (isnan(logReturnForecast)) {
+        logReturnForecast = 0.0000001;
+    }
     return {
-        .price = m_price * std::exp(logReturnForecast*std::log(m_historySize/(m_tauHist/10))),
+        .price = m_price * std::exp(logReturnForecast*std::max(1.0,std::log(m_historySize))),
         .varianceOfLastLogReturns =  varLastLogs};
 }
 
@@ -571,24 +544,61 @@ void StylizedTraderAgent::placeOrderChiarella(BookId bookId)
 {
     const ForecastResult forecastResult = forecast(bookId);
     
+    const auto freeBase =
+        taosim::util::decimal2double(simulation()->account(name()).at(bookId).base.getFree());
+    const auto freeQuote =
+        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote.getFree());
 
     if (m_riskAversion * forecastResult.varianceOfLastLogReturns == 0.0) {
+        // ERROR recovery rebalance in order to keep things flowing
+        double quoteValue = freeQuote/m_price;
+        double ordQty =  std::uniform_real_distribution<double>{0.1,std::abs(quoteValue-freeBase)} (*m_rng);
+        if (freeBase < quoteValue) {
+            simulation()->dispatchMessage(
+                simulation()->currentTimestamp(),
+                orderPlacementLatency(),
+                name(),
+                m_exchange,
+                "PLACE_ORDER_MARKET",
+                MessagePayload::create<PlaceOrderMarketPayload>(
+                    OrderDirection::BUY,
+                    taosim::util::double2decimal(ordQty),
+                    bookId));
+        } else if (freeBase > quoteValue) {
+            simulation()->dispatchMessage(
+                simulation()->currentTimestamp(),
+                orderPlacementLatency(),
+                name(),
+                m_exchange,
+                "PLACE_ORDER_MARKET",
+                MessagePayload::create<PlaceOrderMarketPayload>(
+                    OrderDirection::SELL,
+                    taosim::util::double2decimal(ordQty),
+                    bookId));
+        }
         return;
     }
 
 
-    const auto freeBase =
-        taosim::util::decimal2double(simulation()->account(name()).at(bookId).base.getFree())*0.99;
-    const auto freeQuote =
-        taosim::util::decimal2double(simulation()->account(name()).at(bookId).quote.getFree())*0.99;
+
     const auto [indifferencePrice, indifferencePriceConverged] =
         calculateIndifferencePrice(forecastResult, freeBase, freeQuote);
-    if (!indifferencePriceConverged) return;
+    if (!indifferencePriceConverged){ 
+        // No attempt to recover
+        return;}
 
     auto [minimumPrice, minimumPriceConverged] =
         calculateMinimumPrice(forecastResult, freeBase, freeQuote);
-    if (!minimumPriceConverged) return;
-
+    if (!minimumPriceConverged) {
+            // Try to recover
+            double worstcase = m_price*std::exp(-3*std::sqrt(forecastResult.varianceOfLastLogReturns));
+            if (worstcase < indifferencePrice) {
+                minimumPrice = worstcase;
+            }
+            else {
+                minimumPrice = std::max(indifferencePrice*std::exp(-3*std::sqrt(forecastResult.varianceOfLastLogReturns)),m_priceIncrement);
+            }
+        }
     const auto maximumPrice = forecastResult.price;
     
     if (minimumPrice <= 0.0
@@ -597,9 +607,10 @@ void StylizedTraderAgent::placeOrderChiarella(BookId bookId)
         return;
     }
 
-    const double sampledPrice = std::uniform_real_distribution{std::max(minimumPrice,m_priceIncrement), maximumPrice}(*m_rng);
-
+    // Limit ranges due to the fees
+    const double sampledPrice = std::uniform_real_distribution{std::max(minimumPrice*(1.0 + m_wealthFrac),m_priceIncrement), maximumPrice*(1.0-m_wealthFrac)}(*m_rng);
     if (sampledPrice < indifferencePrice) {
+        // Due to the error recoveries, technical adjustments in placements
         placeLimitBuy(bookId, forecastResult, sampledPrice, freeBase, freeQuote);
     }
     else if (sampledPrice > indifferencePrice) {
@@ -738,20 +749,33 @@ void StylizedTraderAgent::placeLimitBuy(
 
     const float postOnlyProb = std::max(1.0/(1.0 + std::exp(-m_slopeVolGuard* (forecastResult.varianceOfLastLogReturns - m_volGuardX0))), m_alpha);
     const bool postOnly = std::bernoulli_distribution{postOnlyProb}(*m_rng);
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        orderPlacementLatency(),
-        name(),
-        m_exchange,
-        "PLACE_ORDER_LIMIT",
-        MessagePayload::create<PlaceOrderLimitPayload>(
-            OrderDirection::BUY,
-            taosim::util::double2decimal(volume),
-            taosim::util::double2decimal(price),
-            bookId,
-            Currency::BASE, //#
-            std::nullopt,
-            postOnly));
+    if ((sampledPrice > m_price*(1.0 + m_wealthFrac) && std::bernoulli_distribution{std::pow((sampledPrice-m_price)/m_price,0.20)} (*m_rng)) && !postOnly) {
+        simulation()->dispatchMessage(
+            simulation()->currentTimestamp(),
+            orderPlacementLatency(),
+            name(),
+            m_exchange,
+            "PLACE_ORDER_MARKET",
+            MessagePayload::create<PlaceOrderMarketPayload>(
+                OrderDirection::BUY,
+                taosim::util::double2decimal(volume),
+                bookId));
+    } else {
+        simulation()->dispatchMessage(
+            simulation()->currentTimestamp(),
+            orderPlacementLatency(),
+            name(),
+            m_exchange,
+            "PLACE_ORDER_LIMIT",
+            MessagePayload::create<PlaceOrderLimitPayload>(
+                OrderDirection::BUY,
+                taosim::util::double2decimal(volume),
+                taosim::util::double2decimal(price),
+                bookId,
+                Currency::BASE, //#
+                std::nullopt,
+                postOnly));
+    }
 }
 
 //-------------------------------------------------------------------------
@@ -777,28 +801,76 @@ void StylizedTraderAgent::placeLimitSell(
     m_orderFlag.at(bookId) = true;
     const float postOnlyProb = std::max(1.0/(1.0 + std::exp(-m_slopeVolGuard* (forecastResult.varianceOfLastLogReturns - m_volGuardX0))), m_alpha);
     const bool postOnly = std::bernoulli_distribution{postOnlyProb}(*m_rng);
-    simulation()->dispatchMessage(
-        simulation()->currentTimestamp(),
-        orderPlacementLatency(),
-        name(),
-        m_exchange,
-        "PLACE_ORDER_LIMIT",
-        MessagePayload::create<PlaceOrderLimitPayload>(
-            OrderDirection::SELL,
-            taosim::util::double2decimal(volume),
-            taosim::util::double2decimal(price),
-            bookId,
-            Currency::BASE, //#
-            std::nullopt,
-            postOnly));
+    if (!postOnly && (sampledPrice < m_price*(1.0 - m_wealthFrac) && std::bernoulli_distribution{std::pow((m_price-sampledPrice)/m_price,0.20)}(*m_rng))) {
+        simulation()->dispatchMessage(
+            simulation()->currentTimestamp(),
+            orderPlacementLatency(),
+            name(),
+            m_exchange,
+            "PLACE_ORDER_MARKET",
+            MessagePayload::create<PlaceOrderMarketPayload>(
+                OrderDirection::SELL,
+                taosim::util::double2decimal(volume),
+                bookId));
+    } else {
+        simulation()->dispatchMessage(
+            simulation()->currentTimestamp(),
+            orderPlacementLatency(),
+            name(),
+            m_exchange,
+            "PLACE_ORDER_LIMIT",
+            MessagePayload::create<PlaceOrderLimitPayload>(
+                OrderDirection::SELL,
+                taosim::util::double2decimal(volume),
+                taosim::util::double2decimal(price),
+                bookId,
+                Currency::BASE, //#
+                std::nullopt,
+                postOnly));
+    }
 }
 
+
+uint64_t StylizedTraderAgent::selectTurn() {
+    const auto& agentBaseNamesToCounts = simulation()->localAgentManager()->roster()->baseNamesToCounts();
+    return  std::uniform_int_distribution<uint64_t>{0, agentBaseNamesToCounts.at(m_baseName) - 1}(*m_rng);
+}
+
+//------------------------------------------------------------------------
+
+void StylizedTraderAgent::handleWakeup(Message::Ptr &msg)
+{
+    const auto payload = std::dynamic_pointer_cast<RetrieveL1Payload>(msg->payload);
+
+    const BookId bookId = payload->bookId;
+    auto chosenAgent = selectTurn();
+    
+    simulation()->dispatchMessage(
+        simulation()->currentTimestamp(),
+            decisionMakingDelay(),
+            name(),
+            fmt::format("{}_{}", m_baseName, chosenAgent),
+            "WAKEUP",
+            MessagePayload::create<RetrieveL1Payload>(bookId));  
+    placeOrderChiarella(bookId);
+}
 //-------------------------------------------------------------------------
 
 Timestamp StylizedTraderAgent::orderPlacementLatency() {
     return static_cast<Timestamp>(std::lerp(m_opl.min, m_opl.max, m_orderPlacementLatencyDistribution->sample(*m_rng)));
 }
 
+//-------------------------------------------------------------------------
+Timestamp StylizedTraderAgent::marketFeedLatency() {
+    return static_cast<Timestamp>(std::min(std::abs(m_marketFeedLatencyDistribution(*m_rng)),
+            +m_marketFeedLatencyDistribution.mean() + 3 * m_marketFeedLatencyDistribution.stddev()));
+}
+//-------------------------------------------------------------------------
+Timestamp StylizedTraderAgent::decisionMakingDelay() {
+    return static_cast<Timestamp>(std::min(std::abs(m_decisionMakingDelayDistribution(*m_rng)),
+             m_decisionMakingDelayDistribution.mean()
+            + 3.0 * m_decisionMakingDelayDistribution.stddev()));
+}
 //-------------------------------------------------------------------------
 
 double StylizedTraderAgent::getProcessValue(BookId bookId, const std::string& name)

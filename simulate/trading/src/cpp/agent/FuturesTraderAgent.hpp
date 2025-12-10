@@ -10,7 +10,6 @@
 #include "Order.hpp"
 
 #include <boost/circular_buffer.hpp>
-#include <boost/random/beta_distribution.hpp>
 #include <boost/math/distributions/rayleigh.hpp>
 
 #include <cmath>
@@ -38,9 +37,16 @@ private:
         double price{};
     };
 
+    struct FuturesDetails
+    {
+        double logReturn;
+        double volumeFactor;
+    };
+
     void handleSimulationStart();
     void handleSimulationStop();
     void handleTradeSubscriptionResponse();
+    void handleWakeup(Message::Ptr &msg);
     void handleRetrieveL1Response(Message::Ptr msg);
     void handleMarketOrderPlacementResponse(Message::Ptr msg);
     void handleMarketOrderPlacementErrorResponse(Message::Ptr msg);
@@ -49,6 +55,7 @@ private:
     void handleCancelOrdersResponse(Message::Ptr msg);
     void handleCancelOrdersErrorResponse(Message::Ptr msg);
     void handleTrade(Message::Ptr msg);
+    uint64_t selectTurn();
 
     void placeOrder(BookId bookId, double bestAsk, double bestBid);
     void placeBid(BookId bookId,double volume, double price);
@@ -56,8 +63,10 @@ private:
     void placeAsk(BookId bookId, double volume, double price);
     void placeSell(BookId bookId, double volume);
     double getProcessValue(BookId bookId, const std::string& name);
-    uint64_t getProcessCount(BookId bookId, const std::string& name);
+    FuturesDetails getProcessDetails(BookId bookId, const std::string& name);
     Timestamp orderPlacementLatency();
+    Timestamp marketFeedLatency();
+    Timestamp decisionMakingDelay();
 
     std::mt19937* m_rng;
     std::string m_exchange;
@@ -78,17 +87,16 @@ private:
 
     DelayBounds m_opl;
     std::vector<bool> m_orderFlag;
-    std::vector<boost::circular_buffer<double>> m_priceHist;
-    std::vector<boost::circular_buffer<double>> m_logReturns;
     
     bool m_debug;
 
     Timestamp m_historySize;
     std::normal_distribution<double> m_marketFeedLatencyDistribution;
+    std::normal_distribution<double> m_decisionMakingDelayDistribution;
     std::vector<TimestampedTradePrice> m_tradePrice;
     std::unique_ptr<taosim::stats::Distribution> m_orderPlacementLatencyDistribution;
-    // std::unique_ptr<toasim::stats::Distribution> m_rayleigh;
     std::string m_baseName;
+    uint32_t m_catUId;
 };
 
 //-------------------------------------------------------------------------

@@ -65,12 +65,14 @@ private:
     void handleSimulationStart();
     void handleSimulationStop();
     void handleTradeSubscriptionResponse();
+    void handleWakeup(Message::Ptr &msg);
     void handleRetrieveL1Response(Message::Ptr msg);
     void handleLimitOrderPlacementResponse(Message::Ptr msg);
     void handleLimitOrderPlacementErrorResponse(Message::Ptr msg);
     void handleCancelOrdersResponse(Message::Ptr msg);
     void handleCancelOrdersErrorResponse(Message::Ptr msg);
     void handleTrade(Message::Ptr msg);
+    uint64_t selectTurn();
 
     ForecastResult forecast(BookId bookId);
     void placeOrderChiarella(BookId bookId);
@@ -94,7 +96,8 @@ private:
     double getProcessValue(BookId bookId, const std::string& name);
     void updateRegime(BookId bookId);
     Timestamp orderPlacementLatency();
-
+    Timestamp marketFeedLatency();
+    Timestamp decisionMakingDelay();
     std::mt19937* m_rng;
     std::string m_exchange;
     uint32_t m_bookCount;
@@ -141,8 +144,9 @@ private:
     std::normal_distribution<double> m_decisionMakingDelayDistribution;
     std::vector<TimestampedTradePrice> m_tradePrice;
     std::unique_ptr<taosim::stats::Distribution> m_orderPlacementLatencyDistribution;
-    std::unique_ptr<taosim::stats::Distribution> m_rayleigh;
     std::string m_baseName;
+    uint32_t m_catUId;
+    double m_wealthFrac = 0.01;
 };
 
 //-------------------------------------------------------------------------

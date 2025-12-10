@@ -3,6 +3,7 @@ add_library(process STATIC
     JumpDiffusion.cpp
     FundamentalPrice.cpp
     FuturesSignal.cpp
+    MagneticField.cpp
     Process.hpp
     ProcessFactory.cpp
     RNG.cpp

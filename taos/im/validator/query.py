@@ -10,8 +10,8 @@ import bittensor as bt
 import posix_ipc
 import mmap
 import struct
-import msgpack
 import gc
+import pickle
 from typing import Dict, Any
 from collections import defaultdict
 from taos.im.protocol import STP
@@ -166,7 +166,7 @@ class QueryService:
             for uid in synapses.keys():
                 if uid not in deregistered_uids:
                     all_miner_volumes[uid] = {
-                        book_id: volume_sums.get(f"{uid},{book_id}", 0.0)
+                        book_id: volume_sums.get((uid,book_id), 0.0)
                         for book_id in range(book_count)
                     }
 
@@ -220,7 +220,7 @@ class QueryService:
 
                         if miner_volumes[instruction.bookId] >= volume_cap and instruction.type != "CANCEL_ORDERS":
                             if not volume_cap_logged:
-                                bt.logging.trace(f"Agent {uid} hit volume cap on one or more books")
+                                bt.logging.info(f"Agent {uid} hit volume cap on one or more books")
                                 volume_cap_logged = True
                             continue
 
@@ -232,8 +232,7 @@ class QueryService:
                                 instruction.stp = STP.CANCEL_OLDEST
 
                         instructions_per_book[instruction.bookId] += 1
-                        
-                        # Enforce max instructions per book
+
                         if instructions_per_book[instruction.bookId] <= max_instructions_per_book:
                             valid_instructions.append(instruction)
                             
@@ -452,7 +451,7 @@ class QueryService:
             if missing_count > 0:
                 bt.logging.info(f"Filled in {missing_count} missing responses as timeouts")
 
-            bt.logging.info(f"Collected {completed_count} Responses ({time.time()-collect_start:.4f}s") 
+            bt.logging.info(f"Collected {completed_count} Responses ({time.time()-collect_start:.4f}s)") 
 
             bt.logging.info(f"Dendrite call completed ({time.time()-query_start:.4f}s | "
                         f"Timeout {self.config.neuron.timeout}s / {self.config.neuron.global_query_timeout}s). "
@@ -466,17 +465,15 @@ class QueryService:
             )
             bt.logging.info(f"Validated Responses ({time.time()-validate_start:.4f}s).")
 
-            serialize_start = time.time()
-            serialized_responses = {}
-            for uid, response in synapse_responses.items():
-                serialized_responses[uid] = response.model_dump()
-            bt.logging.info(f"Serialized Responses ({time.time()-serialize_start:.4f}s).")
-
             return {
                 'success': True,
-                'responses': serialized_responses,
+                'responses': synapse_responses,
                 'validation_stats': {
-                    "total_responses" : total_responses, "total_instructions" : total_instructions, "success" : success, "timeouts" : timeouts, "failures" : failures
+                    "total_responses": total_responses,
+                    "total_instructions": total_instructions,
+                    "success": success,
+                    "timeouts": timeouts,
+                    "failures": failures
                 }
             }
 
@@ -507,6 +504,13 @@ class QueryService:
         await self.initialize()
 
         bt.logging.info("Query service ready, waiting for requests...")
+    
+        while True:
+            try:
+                self.request_queue.receive(timeout=0.001)
+                bt.logging.warning("Drained stale message from query request queue")
+            except posix_ipc.BusyError:
+                break
 
         while self.running:
             try:
@@ -519,13 +523,14 @@ class QueryService:
                     self.request_mem.seek(0)
                     size_bytes = self.request_mem.read(8)
                     data_size = struct.unpack('Q', size_bytes)[0]
-                    request_data = msgpack.unpackb(self.request_mem.read(data_size), raw=False, strict_map_key=False)
+                    request_bytes = self.request_mem.read(data_size)
+                    request_data = pickle.loads(request_bytes)
                     bt.logging.info(f"Read request data ({time.time()-read_start:.4f}s).")
 
                     result = await self.query_miners(request_data)
 
                     write_start = time.time()
-                    result_bytes = msgpack.packb(result)
+                    result_bytes = pickle.dumps(result, protocol=5)
                     self.response_mem.seek(0)
                     self.response_mem.write(struct.pack('Q', len(result_bytes)))
                     self.response_mem.write(result_bytes)
@@ -592,6 +597,7 @@ if __name__ == '__main__':
     bt.logging.set_info()
 
     parser.add_argument('--netuid', type=int, default=1)
+    parser.add_argument('--logging.level', type=str, default="info")
     parser.add_argument('--neuron.timeout', type=float, default=3.0)
     parser.add_argument('--neuron.global_query_timeout', type=float, default=4.0)
     parser.add_argument('--compression.level', type=int, default=1)

@@ -133,21 +133,25 @@ response.market_order(
     delay: int = 0,
     clientOrderId: int | None = None,
     stp: STP = STP.CANCEL_OLDEST,
-    currency: OrderCurrency = OrderCurrency.BASE
+    currency: OrderCurrency = OrderCurrency.BASE,
+    leverage: float = 0.0,
+    settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE
 )
 ```
 
 ##### **Arguments**
 
-| Parameter         | Type                       | Description                                                                                                                               |
-|--------------------|----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
-| `book_id`          | `int`                      | ID of the order book where the order will be placed.                                                                                     |
-| `direction`        | `OrderDirection`           | `OrderDirection.BUY` or `OrderDirection.SELL`.                                                                                            |
-| `quantity`         | `float`                    | Amount to buy/sell in `currency`.                                                                                                         |
-| `delay`            | `int`, optional            | Delay in simulation nanoseconds before the order reaches the market.                                                                      |
-| `clientOrderId`    | `int` or `None`, optional  | Optional client-specified order ID for tracking.                                                                                          |
-| `stp`              | `STP`, optional            | Self-trade prevention strategy (`STP.CANCEL_OLDEST`, `STP.CANCEL_NEWEST`, `STP.CANCEL_BOTH`, `STP.DECREASE_CANCEL`). Defaults to `CANCEL_OLDEST`.                             |
-| `currency`         | `OrderCurrency`, optional  | Currency to use for the order quantity (`OrderCurrency.BASE` or `OrderCurrency.QUOTE`). Defaults to BASE.                                 |
+| Parameter            | Type                                    | Description                                                                                                                               |
+|----------------------|-----------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| `book_id`            | `int`                                   | ID of the order book where the order will be placed.                                                                                     |
+| `direction`          | `OrderDirection`                        | `OrderDirection.BUY` or `OrderDirection.SELL`.                                                                                            |
+| `quantity`           | `float`                                 | Amount to buy/sell in `currency`.                                                                                                         |
+| `delay`              | `int`, optional                         | Delay in simulation nanoseconds before the order reaches the market. This delay is added to the delay calculated based on response time. Defaults to `0`.                                                                      |
+| `clientOrderId`      | `int` or `None`, optional               | Optional client-specified order ID for tracking.                                                                                          |
+| `stp`                | `STP`, optional                         | Self-trade prevention strategy (`STP.NO_STP`, `STP.CANCEL_OLDEST`, `STP.CANCEL_NEWEST`, `STP.CANCEL_BOTH`, `STP.DECREASE_CANCEL`). Defaults to `STP.CANCEL_OLDEST`.                             |
+| `currency`           | `OrderCurrency`, optional               | Currency to use for the order quantity (`OrderCurrency.BASE` or `OrderCurrency.QUOTE`). If set to `QUOTE`, the `quantity` will be interpreted as the amount of QUOTE currency to exchange. Defaults to `BASE`.                                 |
+| `leverage`           | `float`, optional                       | Leverage multiplier to apply to the order. The effective order quantity will be `(1+leverage)`. For example, an order for 1.0 BASE with 0.5 leverage will be placed for 1.5 BASE total, where 0.5 is borrowed from the exchange. Must be non-negative. Defaults to `0.0` (no leverage).                                 |
+| `settlement_option`  | `LoanSettlementOption` or `int`, optional | Strategy for settling outstanding margin loans using the proceeds of this order. Options: `LoanSettlementOption.NONE` (no loan repayments), `LoanSettlementOption.FIFO` (repay loans starting from oldest), or an integer order ID to repay the loan associated with a specific order. Defaults to `NONE`. Note: only unleveraged orders (`leverage=0`) can settle loans.                                 |
 
 ##### **Example**
 ```python
@@ -155,7 +159,8 @@ response.market_order(
     book_id=1,
     direction=OrderDirection.BUY,
     quantity=100.0,
-    delay=50_000_000  # 50ms delay
+    delay=50_000_000,  # 50ms delay
+    leverage=0.5  # 50% leverage
 )
 ```
 
@@ -177,24 +182,28 @@ response.limit_order(
     stp: STP = STP.CANCEL_OLDEST,
     postOnly: bool = False,
     timeInForce: TimeInForce = TimeInForce.GTC,
-    expiryPeriod: int | None = None
+    expiryPeriod: int | None = None,
+    leverage: float = 0.0,
+    settlement_option: LoanSettlementOption | int = LoanSettlementOption.NONE
 )
 ```
 
 ##### **Arguments**
 
-| Parameter         | Type                        | Description                                                                                                                                                                        |
-|--------------------|-----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `book_id`          | `int`                       | ID of the order book where the order will be placed.                                                                                                                              |
-| `direction`        | `OrderDirection`            | `OrderDirection.BUY` or `OrderDirection.SELL`.                                                                                                                                     |
-| `quantity`         | `float`                     | Quantity of the asset to trade.                                                                                                                                                    |
-| `price`            | `float`                     | Price at which to place the limit order.                                                                                                                                           |
-| `delay`            | `int`, optional             | Delay in simulation nanoseconds before the order reaches the market. Defaults to `0`.                                                                                              |
-| `clientOrderId`    | `int` or `None`, optional   | Optional client-specified order ID for tracking.                                                                                                                                   |
-| `stp`              | `STP`, optional             | Self-trade prevention strategy (`STP.CANCEL_OLDEST`, `STP.CANCEL_NEWEST`, `STP.CANCEL_BOTH`, `STP.DECREASE_CANCEL`). Defaults to `STP.CANCEL_OLDEST`.                                                                                                                      |
-| `postOnly`         | `bool`, optional            | If True, prevents the order from matching immediately. Defaults to `False`.                                                                                                       |
-| `timeInForce`      | `TimeInForce`, optional     | Time-in-force option (`TimeInForce.GTC`, `TimeInForce.GTT`, `TimeInForce.IOC`, `TimeInForce.FOK`). Defaults to `TimeInForce.GTC`.                                                                                                              |
-| `expiryPeriod`     | `int` or `None`, optional   | Expiry period for `GTT` orders, in simulation nanoseconds.                                                                                                                         |
+| Parameter            | Type                                    | Description                                                                                                                                                                        |
+|----------------------|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `book_id`            | `int`                                   | ID of the order book where the order will be placed.                                                                                                                              |
+| `direction`          | `OrderDirection`                        | `OrderDirection.BUY` or `OrderDirection.SELL`.                                                                                                                                     |
+| `quantity`           | `float`                                 | Quantity of the asset to trade.                                                                                                                                                    |
+| `price`              | `float`                                 | Price at which to place the limit order.                                                                                                                                           |
+| `delay`              | `int`, optional                         | Delay in simulation nanoseconds before the order reaches the market. This delay is added to the delay calculated based on response time. Defaults to `0`.                                                                                              |
+| `clientOrderId`      | `int` or `None`, optional               | Optional client-specified order ID for tracking.                                                                                                                                   |
+| `stp`                | `STP`, optional                         | Self-trade prevention strategy (`STP.NO_STP`, `STP.CANCEL_OLDEST`, `STP.CANCEL_NEWEST`, `STP.CANCEL_BOTH`, `STP.DECREASE_CANCEL`). Defaults to `STP.CANCEL_OLDEST`.                                                                                                                      |
+| `postOnly`           | `bool`, optional                        | If True, prevents the order from matching immediately. If the limit order would match with any existing levels on the book at processing time, the instruction is rejected. Defaults to `False`.                                                                                                       |
+| `timeInForce`        | `TimeInForce`, optional                 | Time-in-force option (`TimeInForce.GTC`, `TimeInForce.GTT`, `TimeInForce.IOC`, `TimeInForce.FOK`). **GTC** (Good Till Cancelled): Order remains on the book until cancelled or executed. **GTT** (Good Till Time): Order remains for `expiryPeriod` nanoseconds unless traded or cancelled. **IOC** (Immediate Or Cancel): Any part not immediately traded is cancelled. **FOK** (Fill Or Kill): Order is rejected if not executed in its entirety immediately. Defaults to `TimeInForce.GTC`.                                                                                                              |
+| `expiryPeriod`       | `int` or `None`, optional               | Expiry period for `GTT` orders, in simulation nanoseconds. Required if `timeInForce` is `GTT`.                                                                                                                         |
+| `leverage`           | `float`, optional                       | Leverage multiplier to apply to the order. The effective order quantity will be `(1+leverage)`. For example, an order for 1.0 BASE with 0.5 leverage will be placed for 1.5 BASE total, where 0.5 is borrowed from the exchange. Must be non-negative. Defaults to `0.0` (no leverage).                                 |
+| `settlement_option`  | `LoanSettlementOption` or `int`, optional | Strategy for settling outstanding margin loans using the proceeds of this order. Options: `LoanSettlementOption.NONE` (no loan repayments), `LoanSettlementOption.FIFO` (repay loans starting from oldest), or an integer order ID to repay the loan associated with a specific order. Defaults to `NONE`. Note: only unleveraged orders (`leverage=0`) can settle loans.                                 |
 
 ##### **Example**
 ```python
@@ -207,6 +216,12 @@ response.limit_order(
     expiryPeriod=10_000_000_000  # 10 seconds
 )
 ```
+
+##### **Notes**
+- If `timeInForce` is `GTT`, `expiryPeriod` must be specified.
+- If `timeInForce` is `IOC` or `FOK`, `postOnly` must be `False`.
+- If `expiryPeriod` is specified but `timeInForce` is not `GTT`, expiry is ignored.
+- You cannot hold leveraged positions on both sides of the book simultaneously.
 
 ---
 
@@ -228,10 +243,10 @@ response.cancel_order(
 
 | Parameter     | Type                | Description                                                                                             |
 |---------------|---------------------|---------------------------------------------------------------------------------------------------------|
-| `book_id`      | `int`               | ID of the order book where the order exists.                                                            |
-| `order_id`     | `int`               | ID of the order to cancel.                                                                              |
-| `quantity`     | `float` or `None`      | Amount to cancel (if None, cancels the entire order).                                                   |
-| `delay`        | `int`, optional     | Delay before the cancellation is processed. Defaults to `0`.                                            |
+| `book_id`     | `int`               | ID of the order book where the order exists.                                                            |
+| `order_id`    | `int`               | ID of the order to cancel.                                                                              |
+| `quantity`    | `float` or `None`, optional | Quantity (in BASE) to cancel. If `None`, cancels the entire order. Defaults to `None`.        |
+| `delay`       | `int`, optional     | Delay in simulation nanoseconds before the cancellation is processed. This delay is added to the delay calculated based on response time. Defaults to `0`.                                            |
 
 ##### **Example**
 ```python
@@ -257,14 +272,16 @@ response.cancel_orders(
 
 | Parameter     | Type           | Description                                                                                                |
 |---------------|----------------|------------------------------------------------------------------------------------------------------------|
-| `book_id`      | `int`          | ID of the order book where the orders exist.                                                               |
-| `order_ids`    | `list[int]`    | List of order IDs to cancel.                                                                               |
-| `delay`        | `int`, optional| Delay before the cancellations are processed. Defaults to `0`.                                             |
+| `book_id`     | `int`          | ID of the order book where the orders exist.                                                               |
+| `order_ids`   | `list[int]`    | List of order IDs to cancel. Each order is fully cancelled.                                               |
+| `delay`       | `int`, optional| Delay in simulation nanoseconds before the cancellations are processed. This delay is added to the delay calculated based on response time. Defaults to `0`.                                             |
 
 ##### **Example**
 ```python
 response.cancel_orders(book_id=1, order_ids=[42, 43, 44])
 ```
+
+---
 
 #### `close_position(...)`
 
@@ -286,8 +303,8 @@ response.close_position(
 |---------------|---------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
 | `book_id`     | `int`               | ID of the order book where the leveraged order exists.                                                                                   |
 | `order_id`    | `int`               | ID of the leveraged order to close and settle.                                                                                            |
-| `quantity`    | `float` or `None`, optional | Amount (in base currency) to close. If `None`, closes the entire position associated with the specified order.                            |
-| `delay`       | `int`, optional     | Delay in simulation nanoseconds before the instruction is processed at the exchange. This delay is added to the one based on your validator response time. Defaults to `0`. |
+| `quantity`    | `float` or `None`, optional | Quantity (in BASE) to close. If `None`, closes the entire position associated with the specified order. Defaults to `None`.              |
+| `delay`       | `int`, optional     | Delay in simulation nanoseconds before the instruction is processed at the exchange. This delay is added to the delay calculated based on response time. Defaults to `0`. |
 
 ##### **Example**
 ```python
@@ -320,7 +337,7 @@ response.close_positions(
 |---------------|----------------|--------------------------------------------------------------------------------------------------------------------------------------------|
 | `book_id`     | `int`          | ID of the order book where the leveraged orders exist.                                                                                     |
 | `order_ids`   | `list[int]`    | List of leveraged order IDs to close and settle. Each position is fully closed.                                                            |
-| `delay`       | `int`, optional| Delay in simulation nanoseconds before the instruction is processed at the exchange. This delay is added to the one based on your validator response time. Defaults to `0`. |
+| `delay`       | `int`, optional| Delay in simulation nanoseconds before the instruction is processed at the exchange. This delay is added to the delay calculated based on response time. Defaults to `0`. |
 
 ##### **Example**
 ```python

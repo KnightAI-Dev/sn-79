@@ -138,6 +138,7 @@ if __name__ != "__mp_main__":
                 sys.executable,
                 '-u',
                 '../validator/query.py',
+                '--logging.trace' if self.config.logging.trace else '--logging.debug' if self.config.logging.debug else '--logging.info',
                 '--wallet.path', self.config.wallet.path,
                 '--wallet.name', self.config.wallet.name,
                 '--wallet.hotkey', self.config.wallet.hotkey,
@@ -181,6 +182,53 @@ if __name__ != "__mp_main__":
                         raise RuntimeError(f"Query service died with exit code {self.query_process.returncode}")
 
             raise RuntimeError("Timeout waiting for query service IPC resources")
+        
+        def _start_reporting_service(self):
+            bt.logging.info(f"Starting reporting service from: ../validator/report.py")
+            
+            self._reporting = False
+            
+            cmd = [
+                sys.executable,
+                '-u',
+                '../validator/report.py',
+                '--logging.trace' if self.config.logging.trace else '--logging.debug' if self.config.logging.debug else '--logging.info',
+                '--wallet.path', self.config.wallet.path,
+                '--wallet.name', self.config.wallet.name,
+                '--wallet.hotkey', self.config.wallet.hotkey,
+                '--subtensor.network', self.config.subtensor.network,
+                '--netuid', str(self.config.netuid),
+                '--prometheus.port', str(self.config.prometheus.port),
+                '--prometheus.level', str(self.config.prometheus.level),
+            ]
+            
+            self.reporting_process = subprocess.Popen(cmd, stderr=sys.stderr)
+            bt.logging.info(f"Reporting service PID: {self.reporting_process.pid}")
+            
+            bt.logging.info("Waiting for reporting service IPC resources...")
+            max_retries = 30
+            for attempt in range(max_retries):
+                try:
+                    self.reporting_request_queue = posix_ipc.MessageQueue("/validator-report-req")
+                    self.reporting_response_queue = posix_ipc.MessageQueue("/validator-report-res")
+                    self.reporting_request_shm = posix_ipc.SharedMemory("/validator-report-data")
+                    self.reporting_response_shm = posix_ipc.SharedMemory("/validator-report-response-data")
+                    
+                    self.reporting_request_mem = mmap.mmap(self.reporting_request_shm.fd, self.reporting_request_shm.size)
+                    self.reporting_response_mem = mmap.mmap(self.reporting_response_shm.fd, self.reporting_response_shm.size)
+                    
+                    bt.logging.info(f"Reporting service ready (shm: {self.reporting_request_shm.size / 1024 / 1024:.0f}MB)")
+                    return
+                    
+                except posix_ipc.ExistentialError:
+                    if attempt == 0:
+                        bt.logging.debug("IPC resources not ready yet, waiting...")
+                    time.sleep(1)
+                    
+                    if self.reporting_process.poll() is not None:
+                        raise RuntimeError(f"Reporting service died with exit code {self.reporting_process.returncode}")
+            
+            raise RuntimeError("Timeout waiting for reporting service IPC resources")
 
         def monitor(self) -> None:
             """
@@ -445,10 +493,10 @@ if __name__ != "__mp_main__":
             self.update_repo()
 
             self.miner_stats = {uid : {'requests' : 0, 'timeouts' : 0, 'failures' : 0, 'rejections' : 0, 'call_time' : []} for uid in range(self.subnet_info.max_uids)}
-            init_metrics(self)
-            publish_info(self)
             self.query_process = None
             self._start_query_service()
+            self.report_process = None
+            self._start_reporting_service()
 
         def __enter__(self):
             """
@@ -657,7 +705,6 @@ if __name__ != "__mp_main__":
             self.recent_trades = {bookId : [] for bookId in range(self.simulation.book_count)}
             self.recent_miner_trades = {uid : {bookId : [] for bookId in range(self.simulation.book_count)} for uid in range(self.subnet_info.max_uids)}
             self.save_state()
-            publish_info(self)
 
         def onEnd(self) -> None:
             """
@@ -1166,52 +1213,137 @@ if __name__ != "__mp_main__":
                 bt.logging.debug(f"[MAINT] Scheduling from thread: {threading.current_thread().name}")
                 bt.logging.debug(f"[MAINT] Main loop ID: {id(self.main_loop)}, Current loop ID: {id(asyncio.get_event_loop())}")
                 self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._maintain()))
+                
+        def _prepare_reporting_data(self):
+            bt.logging.debug(f"Retrieving fundamental prices...")
+            start = time.time()
+            self.load_fundamental()
+            bt.logging.debug(f"Retrieved fundamental prices ({time.time()-start:.4f}s).")
+
+            def serialize_tuple_keys(d):
+                return {str(k): v for k, v in d.items()}
+
+            return {
+                'metagraph_data': {
+                    'hotkeys': [str(hk) for hk in self.metagraph.hotkeys],
+                    'stake': self.metagraph.stake.tolist(),
+                    'trust': self.metagraph.trust.tolist(),
+                    'consensus': self.metagraph.consensus.tolist(),
+                    'incentive': self.metagraph.incentive.tolist(),
+                    'emission': self.metagraph.emission.tolist(),
+                    'validator_trust': self.metagraph.validator_trust.tolist(),
+                    'dividends': self.metagraph.dividends.tolist(),
+                    'active': self.metagraph.active.tolist(),
+                    'last_update': self.metagraph.last_update.tolist(),
+                },
+                'simulation': self.simulation.model_dump(),
+                'last_state': {
+                    'accounts': self.last_state.accounts,
+                    'books': self.last_state.books,
+                    'notices': self.last_state.notices,
+                },
+                'simulation_timestamp': self.simulation_timestamp,
+                'step': self.step,
+                'step_rates': list(self.step_rates),
+                'volume_sums': serialize_tuple_keys(self.volume_sums),
+                'maker_volume_sums': serialize_tuple_keys(self.maker_volume_sums),
+                'taker_volume_sums': serialize_tuple_keys(self.taker_volume_sums),
+                'self_volume_sums': serialize_tuple_keys(self.self_volume_sums),
+                'inventory_history': self.inventory_history,
+                'activity_factors': self.activity_factors,
+                'sharpe_values': self.sharpe_values,
+                'unnormalized_scores': self.unnormalized_scores,
+                'scores': {i: score.item() for i, score in enumerate(self.scores)},
+                'miner_stats': self.miner_stats,
+                'initial_balances': self.initial_balances,
+                'initial_balances_published': self.initial_balances_published,
+                'recent_trades': {bookId: [t.model_dump() for t in trades] for bookId, trades in self.recent_trades.items()},
+                'recent_miner_trades': {
+                    uid: {
+                        bookId: [{'trade': miner_trade.model_dump(), 'role': role} for miner_trade, role in trades]
+                        for bookId, trades in book_trades.items()
+                    }
+                    for uid, book_trades in self.recent_miner_trades.items()
+                },
+                'fundamental_price': self.fundamental_price,
+                'shared_state_rewarding': self.shared_state_rewarding,
+                'current_block': self.current_block,
+                'uid': self.uid,
+            }
 
         async def _report(self):
-            """
-            Internal asynchronous wrapper for executing the reporting routine.
-
-            Behavior:
-                - Sets shared reporting state to prevent duplicate reports.
-                - Adjusts process niceness during reporting.
-                - Executes the report coroutine.
-                - Restores shared state afterward.
-
-            Returns:
-                None
-            """
+            if self._reporting:
+                bt.logging.warning(f"Previous reporting still in progress, skipping step {self.step}")
+                return
+            
+            if self.reporting_process.poll() is not None:
+                bt.logging.error(f"Reporting service died with exit code {self.reporting_process.returncode}")
+                bt.logging.error("Attempting to restart reporting service...")
+                self._start_reporting_service()
+                if self.reporting_process.poll() is not None:
+                    bt.logging.error("Failed to restart reporting service")
+                    return
+            
+            self._reporting = True
+            bt.logging.info(f"Starting Reporting at step {self.step}...")
+            start = time.time()
             try:
-                self.shared_state_reporting = True
-                os.nice(10)
-                await report(self)
-                os.nice(-10)
+                while True:
+                    try:
+                        self.reporting_response_queue.receive(timeout=0.001)
+                        bt.logging.warning("Drained stale message from reporting response queue")
+                    except posix_ipc.BusyError:
+                        break
+                
+                data = self._prepare_reporting_data()
+                
+                write_start = time.time()
+                serialize_start = time.time()
+                data_bytes = msgpack.packb(data, use_bin_type=True)
+                serialize_time = time.time() - serialize_start
+                
+                data_mb = len(data_bytes) / 1024 / 1024
+                bt.logging.info(f"Reporting data: {data_mb:.2f} MB (serialize={serialize_time:.4f}s)")
+                
+                self.reporting_request_mem.seek(0)
+                self.reporting_request_mem.write(struct.pack('Q', len(data_bytes)))
+                self.reporting_request_mem.write(data_bytes)
+                bt.logging.info(f"Wrote reporting data ({time.time()-write_start:.4f}s)")
+                
+                receive_start = time.time()
+                self.reporting_request_queue.send(b'publish')
+                message, _ = self.reporting_response_queue.receive()
+                bt.logging.info(f"Received reporting response ({time.time()-receive_start:.4f}s).")
+
+                read_start = time.time()
+                self.reporting_response_mem.seek(0)
+                size_bytes = self.reporting_response_mem.read(8)
+                data_size = struct.unpack('Q', size_bytes)[0]
+                result_bytes = self.reporting_response_mem.read(data_size)
+                
+                deserialize_start = time.time()
+                result = msgpack.unpackb(result_bytes, raw=False, strict_map_key=False)
+                deserialize_time = time.time() - deserialize_start
+                
+                bt.logging.info(f"Read response data ({time.time()-read_start:.4f}s, deserialize={deserialize_time:.4f}s)")
+                self.initial_balances_published = result['initial_balances_published']
+                self.miner_stats = result['miner_stats']
+                    
+            except Exception as e:
+                bt.logging.error(f"Error sending to reporting service: {e}")
+                import traceback
+                bt.logging.error(traceback.format_exc())
             finally:
-                self.shared_state_reporting = False
+                self._reporting = False
+                bt.logging.info(f"Completed reporting for step {self.step} ({time.time() - start}s)")
 
         def report(self) -> None:
-            """
-            Schedules the reporting routine if reporting conditions are met.
-
-            Conditions:
-                - Reporting is enabled.
-                - A previous simulator state exists.
-                - Current step aligns with scoring interval.
-                - No report is already in progress.
-
-            Behavior:
-                - Logs scheduling information.
-                - Dispatches `_report()` coroutine on the main event loop.
-
-            Returns:
-                None
-            """
             if self.config.reporting.disabled or not self.last_state or self.last_state.timestamp % self.config.scoring.interval != 0:
                 return
-            if self.shared_state_reporting:
+            if self._reporting:
                 bt.logging.warning(f"Skipping reporting at step {self.step} — previous report still running.")
                 return
             bt.logging.debug(f"[REPORT] Scheduling from thread: {threading.current_thread().name}")
-            bt.logging.debug(f"[REPORT] Main loop ID: {id(self.main_loop)}, Current loop ID: {id(asyncio.get_event_loop())}")
             self.main_loop.call_soon_threadsafe(lambda: self.main_loop.create_task(self._report()))
 
         async def _compute_compact_volumes(self) -> Dict:
@@ -1770,7 +1902,7 @@ if __name__ != "__mp_main__":
 
             The method uses run‑in‑executor offloading for blocking IPC operations.
             """
-            def receive(mq_req: posix_ipc.MessageQueue) -> dict:
+            def receive(mq_req: posix_ipc.MessageQueue) -> tuple:
                 msg, priority = mq_req.receive()
                 receive_start = time.time()
                 bt.logging.info(f"Received state update from simulator (msgpack)")
@@ -1789,14 +1921,12 @@ if __name__ != "__mp_main__":
                             time.sleep(0.005)
                         else:
                             bt.logging.error(f"mmap read failed on all 5 attempts: {ex}")
-                            self.pagerduty_alert(f"Failed to mmap read after 5 attempts : {ex}", details={"trace": traceback.format_exc()})
-                            return result, receive_start
+                            return None, receive_start
                     finally:
                         if packed_data is not None or attempt >= 5:
                             shm_req.close_fd()
                 bt.logging.info(f"Retrieved State Update ({time.time() - receive_start}s)")
                 start = time.time()
-                result = None
                 for attempt in range(1, 6):
                     try:
                         result = msgpack.unpackb(packed_data, raw=False, use_list=True, strict_map_key=False)
@@ -1808,8 +1938,7 @@ if __name__ != "__mp_main__":
                             time.sleep(0.005)
                         else:
                             bt.logging.error(f"Msgpack unpack failed on all 5 attempts: {ex}")
-                            self.pagerduty_alert(f"Failed to unpack simulator state after 5 attempts : {ex}", details={"trace": traceback.format_exc()})
-                            return result, receive_start
+                            return None, receive_start
                 return result, receive_start
 
             def respond(response: dict) -> dict:
@@ -1825,6 +1954,7 @@ if __name__ != "__mp_main__":
                 mq_res.close()
 
             mq_req = posix_ipc.MessageQueue("/taosim-req", flags=posix_ipc.O_CREAT, max_messages=1, max_message_size=8)
+            thread_pool = ThreadPoolExecutor(max_workers=4)
             try:
                 while True:
                     response = {"responses": []}
@@ -1832,7 +1962,7 @@ if __name__ != "__mp_main__":
                         loop = asyncio.get_event_loop()
                         t1 = time.time()
                         bt.logging.debug(f"[LISTEN] Starting receive at {t1:.3f}")
-                        message, receive_start = await loop.run_in_executor(None, receive, mq_req)
+                        message, receive_start = await loop.run_in_executor(thread_pool, receive, mq_req)
                         if message:
                             t2 = time.time()
                             bt.logging.debug(f"[LISTEN] Received message in {t2-t1:.4f}s")
@@ -1848,17 +1978,22 @@ if __name__ != "__mp_main__":
                     finally:
                         t5 = time.time()
                         bt.logging.debug(f"[LISTEN] Starting respond at {t5:.3f}")
-                        await loop.run_in_executor(None, respond, response)
+                        await loop.run_in_executor(thread_pool, respond, response)
                         t6 = time.time()
                         bt.logging.debug(f"[LISTEN] Respond completed in {t6-t5:.4f}s")
                         bt.logging.debug(f"[LISTEN] Total loop iteration: {t6-t1:.4f}s")
             finally:
                 mq_req.close()
+                thread_pool.shutdown(wait=True)
 
         def listen(self):
             """
             Synchronous wrapper for the asynchronous `_listen` method.
             """
+            try:
+                os.nice(-10)
+            except PermissionError:
+                bt.logging.warning("Cannot set process priority (need sudo for negative nice values)")
             try:
                 asyncio.run(self._listen())
             except KeyboardInterrupt:
@@ -1897,7 +2032,7 @@ if __name__ != "__mp_main__":
                 raise Exception(f"Incomplete JSON!")
             message = YpyObject(body, 1)
             bt.logging.info(f"Constructed YpyObject ({time.time()-start:.4f}s).")
-            state = MarketSimulationStateUpdate.from_ypy(message) # Populate synapse class from request data
+            state = MarketSimulationStateUpdate.from_ypy(message)
             bt.logging.info(f"Synapse populated ({time.time()-start:.4f}s).")
             del body
 
@@ -1958,7 +2093,7 @@ if __name__ != "__mp_main__":
                     bt.logging.error(f"Unrecognized notification : {message}")
                 else:
                     notices.append(notice)
-            await notify(self, notices) # This method forwards the event notifications to the related miners.
+            await notify(self, notices)
             if ended:
                 self.onEnd()
 
@@ -1978,16 +2113,12 @@ if __name__ != "__mp_main__":
             """
             try:
                 bt.logging.info("Cleaning up query service...")
-
-                # Send shutdown command to query service
                 if hasattr(self, 'request_queue'):
                     try:
                         self.request_queue.send(b'shutdown', timeout=1.0)
                         bt.logging.info("Sent shutdown command to query service")
                     except Exception as e:
                         bt.logging.warning(f"Failed to send shutdown command: {e}")
-
-                # Wait for query process to terminate gracefully
                 if hasattr(self, 'query_process') and self.query_process:
                     try:
                         self.query_process.wait(timeout=5.0)
@@ -2001,7 +2132,6 @@ if __name__ != "__mp_main__":
                             bt.logging.error("Query service did not terminate, killing...")
                             self.query_process.kill()
 
-                # Close memory maps
                 if hasattr(self, 'request_mem'):
                     try:
                         self.request_mem.close()
@@ -2016,7 +2146,6 @@ if __name__ != "__mp_main__":
                     except Exception as e:
                         bt.logging.warning(f"Error closing response memory map: {e}")
 
-                # Close shared memory file descriptors
                 if hasattr(self, 'request_shm'):
                     try:
                         self.request_shm.close_fd()
@@ -2031,7 +2160,6 @@ if __name__ != "__mp_main__":
                     except Exception as e:
                         bt.logging.warning(f"Error closing response shared memory fd: {e}")
 
-                # Close message queues
                 if hasattr(self, 'request_queue'):
                     try:
                         self.request_queue.close()
@@ -2121,11 +2249,9 @@ if __name__ != "__mp_main__":
                 traceback.print_exc()
                 bt.logging.error(f"Error during cleanup: {ex}")
 
-# The main method which runs the validator
 if __name__ == "__main__":
     from taos.im.validator.update import check_repo, update_validator, check_simulator, rebuild_simulator, restart_simulator
     from taos.im.validator.forward import forward, notify
-    from taos.im.validator.report import report, publish_info, init_metrics
     from taos.im.validator.reward import get_rewards
 
     if float(platform.freedesktop_os_release()['VERSION_ID']) < 22.04:

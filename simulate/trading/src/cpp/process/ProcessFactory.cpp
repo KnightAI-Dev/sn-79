@@ -8,6 +8,7 @@
 #include "FundamentalPrice.hpp"
 #include "JumpDiffusion.hpp"
 #include "FuturesSignal.hpp"
+#include "MagneticField.hpp"
 #include "Simulation.hpp"
 #include "taosim/exchange/ExchangeConfig.hpp"
 
@@ -43,6 +44,8 @@ std::unique_ptr<Process> ProcessFactory::createFromXML(pugi::xml_node node, uint
             node, 
             seedShift, 
             taosim::util::decimal2double(m_exchangeConfig->initialPrice));
+    } else if (name == "MagneticField") {
+        return MagneticField::fromXML(m_simulation,node, seedShift, m_simulation->logDir() /   fmt::format("MagneticField-{}.csv", seedShift));
     }
 
     throw std::invalid_argument(fmt::format(
